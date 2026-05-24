@@ -446,10 +446,10 @@ async fn handler(
             let result = smol::unblock(move || -> Result<(), String> {
                 let mut resp = ureq::post(&qwen_url2);
                 for (k, v) in &headers2 {
-                    resp = resp.header(k, v);
+                    resp = resp.set(k, v);
                 }
                 let response = resp
-                    .send(&body2[..])
+                    .send_bytes(&body2)
                     .map_err(|e| format!("Qwen API error: {}", e))?;
 
                 if !response.status().is_success() {
@@ -622,7 +622,7 @@ async fn handler(
                 resp = resp.header(k, v);
             }
             let response = resp
-                .send(&body_bytes[..])
+                .send_bytes(&body_bytes)
                 .map_err(|e| anyhow::anyhow!("Qwen API error: {}", e))?;
 
             if !response.status().is_success() {
@@ -918,6 +918,7 @@ fn main() -> Result<()> {
             let state = state.clone();
 
             smol::spawn(async move {
+                let stream = smol_hyper::rt::FuturesIo::new(stream);
                 let service = service_fn(move |req: Request<Incoming>| {
                     router(req, state.clone())
                 });
