@@ -6,9 +6,9 @@
 
 use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
+use futures::lock::{Mutex, OwnedMutexGuard};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_SESSIONS: usize = 100;
@@ -39,14 +39,12 @@ impl AcquiredSession {
 
 pub struct SessionManager {
     sessions: DashMap<String, SessionEntry>,
-    http: reqwest::Client,
 }
 
 impl SessionManager {
-    pub fn new(http: reqwest::Client) -> Self {
+    pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
-            http,
         }
     }
 
@@ -98,35 +96,39 @@ impl SessionManager {
     }
 
     async fn create_chat(&self, token: &str) -> Result<String> {
-        let resp = self
-            .http
-            .post(format!("{}/chats/new", QWEN_API_BASE))
-            .header("accept", "application/json")
-            .header("content-type", "application/json")
-            .header("referer", "https://chat.qwen.ai/")
-            .header("source", "web")
-            .header("version", "0.8.0")
-            .header("cookie", format!("token={}", token))
-            .json(&serde_json::json!({
+        let token = token.to_string();
+        smol::blocking::unblock(move || {
+            let payload = serde_json::json!({
                 "title": "Agent Chat",
                 "models": [MODEL_NAME],
                 "chat_mode": "normal",
                 "chat_type": "t2t",
                 "timestamp": chrono::Utc::now().timestamp_millis(),
-            }))
-            .send()
-            .await
-            .context("Failed to create Qwen chat")?;
+            });
 
-        if resp.status() == 401 {
-            bail!("Qwen token expired or invalid");
-        }
+            let resp = ureq::post(&format!("{}/chats/new", QWEN_API_BASE))
+                .set("accept", "application/json")
+                .set("content-type", "application/json")
+                .set("referer", "https://chat.qwen.ai/")
+                .set("source", "web")
+                .set("version", "0.8.0")
+                .set("cookie", &format!("token={}", token))
+                .send_json(&payload)
+                .map_err(|e| anyhow::anyhow!("Failed to create Qwen chat: {}", e))?;
 
-        let d: serde_json::Value = resp.json().await.context("Failed to parse chat response")?;
-        d["data"]["id"]
-            .as_str()
-            .map(|s| s.to_string())
-            .context("No chat ID in response")
+            if resp.status() == 401 {
+                bail!("Qwen token expired or invalid");
+            }
+
+            let d: serde_json::Value = resp
+                .into_json()
+                .map_err(|e| anyhow::anyhow!("Failed to parse chat response: {}", e))?;
+            d["data"]["id"]
+                .as_str()
+                .map(|s| s.to_string())
+                .context("No chat ID in response")
+        })
+        .await
     }
 
     fn cleanup_expired(&self) {
