@@ -442,11 +442,7 @@ async fn handler(
         let body2 = body_bytes.clone();
         smol::spawn(async move {
             let result = smol::unblock(move || -> Result<(), String> {
-                let agent = ureq::AgentBuilder::new()
-                    .timeout_connect(std::time::Duration::from_secs(30))
-                    .timeout(std::time::Duration::from_secs(120))
-                    .build();
-                let mut resp = agent.post(&qwen_url2);
+                let mut resp = ureq::post(&qwen_url2);
                 for (k, v) in &headers2 {
                     resp = resp.header(k, v);
                 }
@@ -619,11 +615,7 @@ async fn handler(
         Ok(response)
     } else {
         match smol::unblock(move || -> Result<String> {
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(120))
-                .build();
-            let mut resp = agent.post(&qwen_url);
+            let mut resp = ureq::post(&qwen_url);
             for (k, v) in &headers {
                 resp = resp.header(k, v);
             }
