@@ -113,16 +113,16 @@ impl SessionManager {
                 .header("source", "web")
                 .header("version", "0.8.0")
                 .header("cookie", &format!("token={}", token))
-                .send_json(&payload)
+                .send(serde_json::to_string(&payload).unwrap_or_default())
                 .map_err(|e| anyhow::anyhow!("Failed to create Qwen chat: {}", e))?;
 
             if resp.status() == 401 {
                 bail!("Qwen token expired or invalid");
             }
 
-            let d: serde_json::Value = resp
-                .into_json()
-                .map_err(|e| anyhow::anyhow!("Failed to parse chat response: {}", e))?;
+            let d: serde_json::Value = serde_json::from_str(
+                &resp.into_string().map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?
+            ).map_err(|e| anyhow::anyhow!("Failed to parse chat response: {}", e))?;
             d["data"]["id"]
                 .as_str()
                 .map(|s| s.to_string())

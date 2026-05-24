@@ -346,11 +346,13 @@ fn qwen_request_headers(token: &str) -> Vec<(String, String)> {
 
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
 
-fn box_body<B: http_body::Body<Data = Bytes> + Send + 'static>(body: B) -> BoxBody
+fn box_body<B>(body: B) -> BoxBody
 where
-    B::Error: Into<std::io::Error>,
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display,
 {
-    body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).boxed_unsync()
+    body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))
+        .boxed_unsync()
 }
 
 async fn handler(
@@ -360,7 +362,7 @@ async fn handler(
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| b.boxed_unsync()));
+            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| box_body(b)));
         }
     };
 
@@ -369,7 +371,7 @@ async fn handler(
     let v: serde_json::Value = match serde_json::from_slice(&json_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| b.boxed_unsync()));
+            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| box_body(b)));
         }
     };
 
@@ -378,11 +380,11 @@ async fn handler(
     } else if let Some(input) = v.get("input").and_then(|m| m.as_array()) {
         input
     } else {
-        return Ok(bad_request("messages or input array is required").map(|b| b.boxed_unsync()));
+        return Ok(bad_request("messages or input array is required").map(|b| box_body(b)));
     };
 
     if messages.is_empty() {
-        return Ok(bad_request("messages array cannot be empty").map(|b| b.boxed_unsync()));
+        return Ok(bad_request("messages array cannot be empty").map(|b| box_body(b)));
     }
 
     let is_responses_api = v.get("input").is_some() && v.get("messages").is_none();
@@ -407,7 +409,7 @@ async fn handler(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            return Ok(openai_error_response(status, e.to_string(), "server_error", None, None).map(|b| b.boxed_unsync()));
+            return Ok(openai_error_response(status, e.to_string(), "server_error", None, None).map(|b| box_body(b)));
         }
     };
 
@@ -661,7 +663,7 @@ async fn handler(
                             "rate_limit_exceeded",
                             None,
                             Some("rate_limit"),
-                        ).map(|b| b.boxed_unsync()));
+                        ).map(|b| box_body(b)));
                     }
                 }
 
@@ -764,11 +766,11 @@ async fn handler(
                     }
                 };
 
-                Ok(json_response(StatusCode::OK, &resp_value).map(|b| b.boxed_unsync()))
+                Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)))
             }
             Err(e) => {
                 error!(error = %e, "Qwen API call failed");
-                Ok(internal_error(format!("Qwen API error: {}", e)).map(|b| b.boxed_unsync()))
+                Ok(internal_error(format!("Qwen API error: {}", e)).map(|b| box_body(b)))
             }
         }
     }
@@ -780,14 +782,14 @@ async fn embeddings_handler(
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| b.boxed_unsync()));
+            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| box_body(b)));
         }
     };
 
     let v: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| b.boxed_unsync()));
+            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| box_body(b)));
         }
     };
 
@@ -812,7 +814,7 @@ async fn embeddings_handler(
                 "total_tokens": tokens
             }
         }),
-    ).map(|b| b.boxed_unsync()))
+    ).map(|b| box_body(b)))
 }
 
 async fn router(
