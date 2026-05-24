@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "description": "HTTP contract assertions for raw fetch/curl clients against qwen-proxy-rs",
+  "endpoints": [
+    {
+      "id": "health",
+      "method": "GET",
+      "path": "/health",
+      "expectStatus": 200,
+      "expectJson": {
+        "requiredFields": ["status"]
+      }
+    },
+    {
+      "id": "models_list",
+      "method": "GET",
+      "path": "/v1/models",
+      "expectStatus": 200,
+      "expectJson": {
+        "object": "list",
+        "requiredFields": ["data"],
+        "arrayField": "data",
+        "arrayItemFields": ["id", "object", "owned_by"]
+      }
+    },
+    {
+      "id": "models_get",
+      "method": "GET",
+      "path": "/v1/models/qwen3.6-plus",
+      "expectStatus": 200,
+      "expectJson": {
+        "object": "model",
+        "requiredFields": ["id", "created", "owned_by"]
+      }
+    },
+    {
+      "id": "chat_completion",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "model": "qwen3.6-plus",
+        "messages": [{ "role": "user", "content": "Say hi." }],
+        "user": "contract-checklist-chat"
+      },
+      "expectStatus": 200,
+      "expectJson": {
+        "object": "chat.completion",
+        "idPrefix": "chatcmpl-",
+        "requiredFields": ["id", "created", "model", "choices", "usage"],
+        "choicesFields": ["index", "message", "finish_reason"],
+        "messageFields": ["role", "content"]
+      }
+    },
+    {
+      "id": "chat_completion_stream",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "model": "qwen3.6-plus",
+        "messages": [{ "role": "user", "content": "Say ok." }],
+        "stream": true,
+        "user": "contract-checklist-stream"
+      },
+      "expectStatus": 200,
+      "expectContentTypeIncludes": "text/event-stream",
+      "expectSse": {
+        "chunkObject": "chat.completion.chunk",
+        "requireDone": true
+      }
+    },
+    {
+      "id": "chat_completion_tools",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "model": "qwen3.6-plus",
+        "messages": [{ "role": "user", "content": "What is 2+2? Use the calculator tool." }],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "calculator",
+              "description": "Evaluate math",
+              "parameters": {
+                "type": "object",
+                "properties": { "expression": { "type": "string" } },
+                "required": ["expression"]
+              }
+            }
+          }
+        ],
+        "user": "contract-checklist-tools"
+      },
+      "expectStatus": 200,
+      "expectJson": {
+        "object": "chat.completion",
+        "requiredFields": ["choices"],
+        "allowFinishReasons": ["stop", "tool_calls"]
+      }
+    },
+    {
+      "id": "chat_completion_error",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": { "model": "qwen3.6-plus" },
+      "expectStatus": 400,
+      "expectError": true
+    },
+    {
+      "id": "responses_api",
+      "method": "POST",
+      "path": "/v1/responses",
+      "body": {
+        "model": "qwen3.6-plus",
+        "input": [{ "role": "user", "content": "Say hello." }],
+        "user": "contract-checklist-responses"
+      },
+      "expectStatus": 200,
+      "expectJson": {
+        "object": "response",
+        "requiredFields": ["id", "output"]
+      }
+    },
+    {
+      "id": "embeddings_stub",
+      "method": "POST",
+      "path": "/v1/embeddings",
+      "body": {
+        "model": "text-embedding-3-small",
+        "input": "hello"
+      },
+      "expectStatus": 200,
+      "expectJson": {
+        "object": "list",
+        "requiredFields": ["data"],
+        "arrayField": "data",
+        "arrayItemFields": ["object", "embedding", "index"]
+      }
+    },
+    {
+      "id": "cors",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "headers": { "Origin": "http://example.com" },
+      "body": {
+        "model": "qwen3.6-plus",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "user": "contract-checklist-cors"
+      },
+      "expectStatus": 200,
+      "expectResponseHeaders": {
+        "access-control-allow-origin": "*"
+      }
+    }
+  ]
+}

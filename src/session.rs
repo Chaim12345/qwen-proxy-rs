@@ -1,0 +1,147 @@
+//! Qwen chat session management.
+//!
+//! Reusing a `chat_id` across turns is fine. Qwen returns 429 ("chat in progress") only when
+//! two messages are sent on the same chat before the prior response finishes — we serialize
+//! per-chat with an in-flight mutex.
+
+use anyhow::{bail, Context, Result};
+use dashmap::DashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_SESSIONS: usize = 100;
+const MODEL_NAME: &str = "qwen3.7-max";
+const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
+
+#[derive(Clone)]
+struct SessionEntry {
+    chat_id: String,
+    parent_id: Arc<Mutex<Option<String>>>,
+    created_at: Instant,
+    in_flight: Arc<Mutex<()>>,
+}
+
+/// Holds a per-chat in-flight lock until dropped (after the Qwen response completes).
+pub struct AcquiredSession {
+    pub chat_id: String,
+    pub parent_id: Option<String>,
+    pub parent_store: Arc<Mutex<Option<String>>>,
+    _in_flight_guard: OwnedMutexGuard<()>,
+}
+
+impl AcquiredSession {
+    pub async fn set_parent_id(&self, parent_id: String) {
+        *self.parent_store.lock().await = Some(parent_id);
+    }
+}
+
+pub struct SessionManager {
+    sessions: DashMap<String, SessionEntry>,
+    http: reqwest::Client,
+}
+
+impl SessionManager {
+    pub fn new(http: reqwest::Client) -> Self {
+        Self {
+            sessions: DashMap::new(),
+            http,
+        }
+    }
+
+    /// Get or create a Qwen chat for `client_key`, then wait until no other request is in-flight
+    /// on that chat.
+    pub async fn acquire(&self, client_key: &str, token: &str) -> Result<AcquiredSession> {
+        self.cleanup_expired();
+
+        if self.sessions.len() >= MAX_SESSIONS {
+            self.evict_oldest();
+        }
+
+        let entry = match self.sessions.get(client_key) {
+            Some(existing) if existing.created_at.elapsed() < SESSION_TTL => existing.clone(),
+            Some(_) => {
+                drop(self.sessions.remove(client_key));
+                self.insert_new_entry(client_key, token).await?
+            }
+            None => self.insert_new_entry(client_key, token).await?,
+        };
+
+        let in_flight_guard = entry.in_flight.lock_owned().await;
+        let parent_id = entry.parent_id.lock().await.clone();
+
+        Ok(AcquiredSession {
+            chat_id: entry.chat_id,
+            parent_id,
+            parent_store: entry.parent_id,
+            _in_flight_guard: in_flight_guard,
+        })
+    }
+
+    async fn insert_new_entry(&self, client_key: &str, token: &str) -> Result<SessionEntry> {
+        let chat_id = self.create_chat(token).await?;
+        tracing::info!(
+            chat_id = %chat_id,
+            client_key = %client_key,
+            "Created Qwen chat (will reuse until TTL; concurrent sends on same chat are queued)"
+        );
+        let entry = SessionEntry {
+            chat_id,
+            parent_id: Arc::new(Mutex::new(None)),
+            created_at: Instant::now(),
+            in_flight: Arc::new(Mutex::new(())),
+        };
+        self.sessions
+            .insert(client_key.to_string(), entry.clone());
+        Ok(entry)
+    }
+
+    async fn create_chat(&self, token: &str) -> Result<String> {
+        let resp = self
+            .http
+            .post(format!("{}/chats/new", QWEN_API_BASE))
+            .header("accept", "application/json")
+            .header("content-type", "application/json")
+            .header("referer", "https://chat.qwen.ai/")
+            .header("source", "web")
+            .header("version", "0.8.0")
+            .header("cookie", format!("token={}", token))
+            .json(&serde_json::json!({
+                "title": "Agent Chat",
+                "models": [MODEL_NAME],
+                "chat_mode": "normal",
+                "chat_type": "t2t",
+                "timestamp": chrono::Utc::now().timestamp_millis(),
+            }))
+            .send()
+            .await
+            .context("Failed to create Qwen chat")?;
+
+        if resp.status() == 401 {
+            bail!("Qwen token expired or invalid");
+        }
+
+        let d: serde_json::Value = resp.json().await.context("Failed to parse chat response")?;
+        d["data"]["id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .context("No chat ID in response")
+    }
+
+    fn cleanup_expired(&self) {
+        let cutoff = Instant::now() - SESSION_TTL;
+        self.sessions.retain(|_, s| s.created_at > cutoff);
+    }
+
+    fn evict_oldest(&self) {
+        if let Some(oldest_key) = self
+            .sessions
+            .iter()
+            .min_by_key(|e| e.created_at)
+            .map(|e| e.key().clone())
+        {
+            self.sessions.remove(&oldest_key);
+        }
+    }
+}
