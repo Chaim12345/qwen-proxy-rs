@@ -12,6 +12,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use qwen::*;
 use session::SessionManager;
+use smol_hyper;
 use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
@@ -119,13 +120,6 @@ fn not_found_response() -> Response<Full<Bytes>> {
     json_response(
         StatusCode::NOT_FOUND,
         &serde_json::json!({"error": {"message": "Not found", "type": "not_found"}}),
-    )
-}
-
-fn method_not_allowed() -> Response<Full<Bytes>> {
-    json_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        &serde_json::json!({"error": {"message": "Method not allowed", "type": "method_not_allowed"}}),
     )
 }
 
@@ -339,33 +333,34 @@ fn parse_qwen_sse_line(line: &str) -> Option<String> {
     }
 }
 
-fn qwen_request_headers(token: &str) -> Vec<(&str, String)> {
+fn qwen_request_headers(token: &str) -> Vec<(String, String)> {
     vec![
-        ("accept", "text/event-stream".to_string()),
-        ("content-type", "application/json".to_string()),
-        ("referer", "https://chat.qwen.ai/".to_string()),
-        ("source", "web".to_string()),
-        ("version", "0.8.0".to_string()),
-        ("cookie", format!("token={}", token)),
+        ("accept".to_string(), "text/event-stream".to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+        ("referer".to_string(), "https://chat.qwen.ai/".to_string()),
+        ("source".to_string(), "web".to_string()),
+        ("version".to_string(), "0.8.0".to_string()),
+        ("cookie".to_string(), format!("token={}", token)),
     ]
+}
+
+type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+
+fn box_body<B: http_body::Body<Data = Bytes> + Send + 'static>(body: B) -> BoxBody
+where
+    B::Error: Into<std::io::Error>,
+{
+    body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).boxed_unsync()
 }
 
 async fn handler(
     req: Request<Incoming>,
     st: Arc<AppState>,
-) -> Result<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible>
-{
+) -> Result<Response<BoxBody>, Infallible> {
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            return Ok(openai_error_response(
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read body: {}", e),
-                "invalid_request_error",
-                None,
-                None,
-            )
-            .map(|b| b.boxed_unsync()));
+            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| b.boxed_unsync()));
         }
     };
 
@@ -374,9 +369,7 @@ async fn handler(
     let v: serde_json::Value = match serde_json::from_slice(&json_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(
-                bad_request(format!("Invalid JSON: {}", e)).map(|b| b.boxed_unsync())
-            );
+            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| b.boxed_unsync()));
         }
     };
 
@@ -385,15 +378,11 @@ async fn handler(
     } else if let Some(input) = v.get("input").and_then(|m| m.as_array()) {
         input
     } else {
-        return Ok(
-            bad_request("messages or input array is required").map(|b| b.boxed_unsync())
-        );
+        return Ok(bad_request("messages or input array is required").map(|b| b.boxed_unsync()));
     };
 
     if messages.is_empty() {
-        return Ok(
-            bad_request("messages array cannot be empty").map(|b| b.boxed_unsync())
-        );
+        return Ok(bad_request("messages array cannot be empty").map(|b| b.boxed_unsync()));
     }
 
     let is_responses_api = v.get("input").is_some() && v.get("messages").is_none();
@@ -404,8 +393,13 @@ async fn handler(
     debug!(messages = messages.len(), stream = is_stream, "Processing request");
 
     let client_key = client_session_key(&v);
-    let session = match st.sessions.acquire(&client_key, &st.token).await {
-        Ok(s) => s,
+    let (session, session_id, parent_id, parent_store) = match st.sessions.acquire(&client_key, &st.token).await {
+        Ok(s) => {
+            let sid = s.chat_id.clone();
+            let pid = s.parent_id.clone();
+            let ps = s.parent_store.clone();
+            (s, sid, pid, ps)
+        }
         Err(e) => {
             error!(error = %e, client_key = %client_key, "Failed to acquire session");
             let status = if e.to_string().contains("expired") {
@@ -413,20 +407,9 @@ async fn handler(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            return Ok(openai_error_response(
-                status,
-                e.to_string(),
-                "server_error",
-                None,
-                None,
-            )
-            .map(|b| b.boxed_unsync()));
+            return Ok(openai_error_response(status, e.to_string(), "server_error", None, None).map(|b| b.boxed_unsync()));
         }
     };
-
-    let session_id = session.chat_id.clone();
-    let parent_id = session.parent_id.clone();
-    let parent_store = session.parent_store.clone();
 
     let prompt = if tools.is_empty() {
         msg
@@ -448,31 +431,31 @@ async fn handler(
     let prompt_tokens = estimate_tokens(&prompt);
     let model = request_model(&v);
 
-    // Make the HTTP request to Qwen via ureq (blocking, run in thread pool)
     let body_bytes: Vec<u8> = serde_json::to_vec(&payload).unwrap_or_default();
-    let qwen_url_clone = qwen_url.clone();
 
     if is_stream {
-        // Streaming: spawn blocking task that reads SSE and sends chunks through a channel
         let (tx, rx) = smol::channel::bounded::<Result<String, String>>(256);
 
         let tx2 = tx.clone();
         let headers2 = headers.clone();
-        let body_clone = body_bytes.clone();
+        let qwen_url2 = qwen_url.clone();
+        let body2 = body_bytes.clone();
         smol::spawn(async move {
-            let result = smol::blocking::unblock(move || -> Result<(), String> {
-                let mut resp = ureq::post(&qwen_url_clone);
+            let result = smol::unblock(move || -> Result<(), String> {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_connect(std::time::Duration::from_secs(30))
+                    .timeout(std::time::Duration::from_secs(120))
+                    .build();
+                let mut resp = agent.post(&qwen_url2);
                 for (k, v) in &headers2 {
-                    resp = resp.set(k, v);
+                    resp = resp.header(k, v);
                 }
                 let response = resp
-                    .send_bytes(&body_clone)
+                    .send(&body2[..])
                     .map_err(|e| format!("Qwen API error: {}", e))?;
 
                 if !response.status().is_success() {
-                    let body_text = response
-                        .into_string()
-                        .unwrap_or_default();
+                    let body_text = response.into_string().unwrap_or_default();
                     let preview: String = body_text.chars().take(500).collect();
                     error!(status = %response.status(), body_preview = %preview, "Qwen chat/completions returned error");
                     if response.status() == 429 || body_text.contains("in progress") {
@@ -481,15 +464,15 @@ async fn handler(
                     return Err(format!("Qwen API returned {}", response.status()));
                 }
 
+                use std::io::Read;
                 let mut reader = response.into_reader();
-                let mut buf = [0u8; 4096];
+                let mut buf = vec![0u8; 4096];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let chunk = buf[..n].to_vec();
                             if tx2.try_send(Ok(
-                                String::from_utf8_lossy(&chunk).to_string()
+                                String::from_utf8_lossy(&buf[..n]).to_string()
                             )).is_err() {
                                 break;
                             }
@@ -504,18 +487,17 @@ async fn handler(
             }).await;
             drop(tx);
             if let Err(e) = result {
-                let _ = tx2.try_send(Err(e));
+                let _ = tx.try_send(Err(e));
             }
         }).detach();
 
-        // Convert channel receiver into a Stream
+        let has_tools = !tools.is_empty();
         let sse_stream = futures::stream::unfold(
-            (rx, String::new(), String::new(), session),
-            move |(rx, mut buf, mut full_text, session_guard)| async move {
+            (rx, String::new(), String::new()),
+            move |(rx, mut buf, mut full_text)| async move {
                 match rx.recv().await {
                     Ok(Ok(chunk)) => {
                         buf.push_str(&chunk);
-                        // Process SSE lines in buffer
                         let mut events = Vec::new();
                         loop {
                             if let Some(nl) = buf.find('\n') {
@@ -529,45 +511,30 @@ async fn handler(
                                         append_sse_delta(&mut full_text, &ch);
                                     }
                                 }
-                                // Check for tool calls after each event
                                 let tc = detect_tool(&full_text, &tools);
-                                if let Some(tc) = tc {
-                                    info!(tool = %tc.name, "Detected tool call (streaming)");
-                                    let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-                                    let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-                                    for chunk_str in build_tool_call_stream_chunks(
-                                        &completion_id, &model, created, &tool_call_id, &tc.name, &args,
-                                    ) {
-                                        events.push(format!("data: {}\n\n", chunk_str));
-                                    }
-                                    // After tool call detection, we don't continue streaming content
+                                if tc.is_some() {
                                     break;
-                                } else {
-                                    let visible = client_visible_content(&full_text, None, !tools.is_empty());
-                                    let content_bytes = visible.as_bytes();
-                                    let chunk_size = 16;
-                                    for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
-                                        let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
-                                        let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
-                                        events.push(format!(
-                                            "data: {}\n\n",
-                                            build_stream_chunk(
-                                                &completion_id, &model, created,
-                                                serde_json::json!({"content": piece.to_string()}),
-                                                None
-                                            )
-                                        ));
-                                    }
                                 }
                             } else {
                                 break;
                             }
                         }
+
+                        let tc = detect_tool(&full_text, &tools);
+                        if let Some(tc) = tc {
+                            info!(tool = %tc.name, "Detected tool call (streaming)");
+                            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
+                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+                            for chunk_str in build_tool_call_stream_chunks(
+                                &completion_id, &model, created, &tool_call_id, &tc.name, &args,
+                            ) {
+                                events.push(format!("data: {}\n\n", chunk_str));
+                            }
+                        }
                         let chunk_str = events.join("");
-                        Some((Ok::<_, Infallible>(Bytes::from(chunk_str)), (rx, buf, full_text, session_guard)))
+                        Some((Ok::<_, std::io::Error>(Bytes::from(chunk_str)), (rx, buf, full_text)))
                     }
                     Ok(Err(err_str)) => {
-                        // Error from Qwen
                         let err_chunk = format!(
                             "data: {}\n\ndata: [DONE]\n\n",
                             build_stream_chunk(
@@ -576,15 +543,14 @@ async fn handler(
                                 Some("stop")
                             )
                         );
-                        Some((Ok::<_, Infallible>(Bytes::from(err_chunk)), (rx, buf, full_text, session_guard)))
+                        Some((Ok::<_, std::io::Error>(Bytes::from(err_chunk)), (rx, buf, full_text)))
                     }
                     Err(_) => {
-                        // Channel closed - stream ended
-                        // Check for tool calls in full text
                         let tc = detect_tool(&full_text, &tools);
                         let mut final_chunks = String::new();
 
                         if let Some(tc) = tc {
+                            info!(tool = %tc.name, "Detected tool call (streaming)");
                             let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
                             let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
                             for chunk_str in build_tool_call_stream_chunks(
@@ -593,20 +559,33 @@ async fn handler(
                                 final_chunks.push_str(&format!("data: {}\n\n", chunk_str));
                             }
                         } else {
-                            let visible = client_visible_content(&full_text, None, !tools.is_empty());
+                            let mut emitted_role = false;
+                            let visible = client_visible_content(&full_text, None, has_tools);
                             let content_bytes = visible.as_bytes();
                             let chunk_size = 16;
                             for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
                                 let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
                                 let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
-                                final_chunks.push_str(&format!(
-                                    "data: {}\n\n",
-                                    build_stream_chunk(
-                                        &completion_id, &model, created,
-                                        serde_json::json!({"content": piece.to_string()}),
-                                        None
-                                    )
-                                ));
+                                if !emitted_role {
+                                    emitted_role = true;
+                                    final_chunks.push_str(&format!(
+                                        "data: {}\n\n",
+                                        build_stream_chunk(
+                                            &completion_id, &model, created,
+                                            serde_json::json!({"role": "assistant", "content": piece.to_string()}),
+                                            None
+                                        )
+                                    ));
+                                } else {
+                                    final_chunks.push_str(&format!(
+                                        "data: {}\n\n",
+                                        build_stream_chunk(
+                                            &completion_id, &model, created,
+                                            serde_json::json!({"content": piece.to_string()}),
+                                            None
+                                        )
+                                    ));
+                                }
                             }
                             final_chunks.push_str(&format!(
                                 "data: {}\n\ndata: [DONE]\n\n",
@@ -618,15 +597,13 @@ async fn handler(
                             ));
                         }
 
-                        Some((Ok::<_, Infallible>(Bytes::from(final_chunks)), (rx, buf, full_text, session_guard)))
+                        Some((Ok::<_, std::io::Error>(Bytes::from(final_chunks)), (rx, buf, full_text)))
                     }
                 }
             },
         );
 
-        let body = StreamBody::new(
-            sse_stream.map(|r| r.map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "stream error"))),
-        );
+        let body = StreamBody::new(sse_stream);
 
         let response = Response::builder()
             .status(200)
@@ -636,31 +613,28 @@ async fn handler(
             .header("access-control-allow-origin", "*")
             .header("access-control-allow-methods", "*")
             .header("access-control-allow-headers", "*")
-            .body(body.boxed_unsync())
+            .body(box_body(body))
             .unwrap();
 
         Ok(response)
     } else {
-        // Non-streaming
-        match smol::blocking::unblock(move || -> Result<String> {
-            let mut resp = ureq::post(&qwen_url);
+        match smol::unblock(move || -> Result<String> {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(120))
+                .build();
+            let mut resp = agent.post(&qwen_url);
             for (k, v) in &headers {
-                resp = resp.set(k, v);
+                resp = resp.header(k, v);
             }
             let response = resp
-                .send_bytes(&body_bytes)
+                .send(&body_bytes[..])
                 .map_err(|e| anyhow::anyhow!("Qwen API error: {}", e))?;
 
             if !response.status().is_success() {
-                let body_text = response
-                    .into_string()
-                    .unwrap_or_default();
+                let body_text = response.into_string().unwrap_or_default();
                 let preview: String = body_text.chars().take(500).collect();
-                error!(
-                    status = %response.status(),
-                    body_preview = %preview,
-                    "Qwen chat/completions returned error"
-                );
+                error!(status = %response.status(), body_preview = %preview, "Qwen chat/completions returned error");
                 if response.status() == 429 || body_text.contains("in progress") {
                     bail!("Qwen chat is busy (another message in flight on this chat_id)");
                 }
@@ -695,8 +669,7 @@ async fn handler(
                             "rate_limit_exceeded",
                             None,
                             Some("rate_limit"),
-                        )
-                        .map(|b| b.boxed_unsync()));
+                        ).map(|b| b.boxed_unsync()));
                     }
                 }
 
@@ -811,8 +784,7 @@ async fn handler(
 
 async fn embeddings_handler(
     req: Request<Incoming>,
-) -> Result<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible>
-{
+) -> Result<Response<BoxBody>, Infallible> {
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
@@ -848,83 +820,68 @@ async fn embeddings_handler(
                 "total_tokens": tokens
             }
         }),
-    )
-    .map(|b| b.boxed_unsync()))
+    ).map(|b| b.boxed_unsync()))
 }
 
 async fn router(
     req: Request<Incoming>,
     st: Arc<AppState>,
-) -> Result<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, anyhow::Error>>, Infallible>
-{
+) -> Result<Response<BoxBody>, Infallible> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
-    let cors_headers = |resp: Response<_>| {
-        let (parts, body) = resp.into_parts();
-        Response::from_parts(
-            http::response::Parts {
-                headers: {
-                    let mut h = parts.headers;
-                    h.insert("access-control-allow-origin", http::HeaderValue::from_static("*"));
-                    h.insert("access-control-allow-methods", http::HeaderValue::from_static("*"));
-                    h.insert("access-control-allow-headers", http::HeaderValue::from_static("*"));
-                    h
-                },
-                ..parts
-            },
-            body,
-        )
+
+    let cors = |resp: Response<BoxBody>| {
+        let (mut parts, body) = resp.into_parts();
+        parts.headers.insert("access-control-allow-origin", http::HeaderValue::from_static("*"));
+        parts.headers.insert("access-control-allow-methods", http::HeaderValue::from_static("*"));
+        parts.headers.insert("access-control-allow-headers", http::HeaderValue::from_static("*"));
+        Response::from_parts(parts, body)
     };
 
-    // Handle CORS preflight
     if method == Method::OPTIONS {
-        return Ok(cors_headers(
+        return Ok(cors(
             Response::builder()
                 .status(204)
-                .body(
-                    http_body_util::Empty::<Bytes>::new()
-                        .boxed_unsync(),
-                )
+                .body(box_body(http_body_util::Empty::<Bytes>::new()))
                 .unwrap(),
         ));
     }
 
     let resp = match (method, path.as_str()) {
-        (Method::GET, "/health") => health_handler().map(|b| b.boxed_unsync()),
-        (Method::GET, "/v1/models") => models_handler().map(|b| b.boxed_unsync()),
+        (Method::GET, "/health") => health_handler().map(|b| box_body(b)),
+        (Method::GET, "/v1/models") => models_handler().map(|b| box_body(b)),
         (Method::GET, p) if p.starts_with("/v1/models/") => {
             let model_id = p.trim_start_matches("/v1/models/");
-            model_handler(model_id).map(|b| b.boxed_unsync())
+            model_handler(model_id).map(|b| box_body(b))
         }
         (Method::POST, "/v1/chat/completions") | (Method::POST, "/v1/responses") => {
             handler(req, st).await.unwrap_or_else(|_| {
-                internal_error("Internal error").map(|b| b.boxed_unsync())
-            })
+                Ok(internal_error("Internal error").map(|b| box_body(b)))
+            })?
         }
         (Method::POST, "/v1/embeddings") => {
             embeddings_handler(req).await.unwrap_or_else(|_| {
-                internal_error("Internal error").map(|b| b.boxed_unsync())
-            })
+                Ok(internal_error("Internal error").map(|b| box_body(b)))
+            })?
         }
-        (Method::GET, p) if p == "/" || p == "" => {
+        (Method::GET, "/") | (Method::GET, "") => {
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({"message": "Qwen OpenAI Proxy (smol+hyper)", "version": "0.1.0"}),
-            )
-            .map(|b| b.boxed_unsync())
+            ).map(|b| box_body(b))
         }
         _ => {
             if method == Method::POST {
                 handler(req, st).await.unwrap_or_else(|_| {
-                    internal_error("Internal error").map(|b| b.boxed_unsync())
-                })
+                    Ok(internal_error("Internal error").map(|b| box_body(b)))
+                })?
             } else {
-                not_found_response().map(|b| b.boxed_unsync())
+                not_found_response().map(|b| box_body(b))
             }
         }
     };
 
-    Ok(cors_headers(resp))
+    Ok(cors(resp))
 }
 
 fn main() -> Result<()> {
@@ -967,7 +924,6 @@ fn main() -> Result<()> {
             let state = state.clone();
 
             smol::spawn(async move {
-                let stream = async_compat::Compat::new(stream);
                 let service = service_fn(move |req: Request<Incoming>| {
                     router(req, state.clone())
                 });

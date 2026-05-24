@@ -97,7 +97,7 @@ impl SessionManager {
 
     async fn create_chat(&self, token: &str) -> Result<String> {
         let token = token.to_string();
-        smol::blocking::unblock(move || {
+        smol::unblock(move || {
             let payload = serde_json::json!({
                 "title": "Agent Chat",
                 "models": [MODEL_NAME],
@@ -107,12 +107,12 @@ impl SessionManager {
             });
 
             let resp = ureq::post(&format!("{}/chats/new", QWEN_API_BASE))
-                .set("accept", "application/json")
-                .set("content-type", "application/json")
-                .set("referer", "https://chat.qwen.ai/")
-                .set("source", "web")
-                .set("version", "0.8.0")
-                .set("cookie", &format!("token={}", token))
+                .header("accept", "application/json")
+                .header("content-type", "application/json")
+                .header("referer", "https://chat.qwen.ai/")
+                .header("source", "web")
+                .header("version", "0.8.0")
+                .header("cookie", &format!("token={}", token))
                 .send_json(&payload)
                 .map_err(|e| anyhow::anyhow!("Failed to create Qwen chat: {}", e))?;
 
