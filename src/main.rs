@@ -454,13 +454,14 @@ async fn handler(
                     .map_err(|e| format!("Qwen API error: {}", e))?;
 
                 if !(200..300).contains(&response.status()) {
+                    let status = response.status();
                     let body_text = response.into_string().unwrap_or_default();
                     let preview: String = body_text.chars().take(500).collect();
-                    error!(status = %response.status(), body_preview = %preview, "Qwen chat/completions returned error");
-                    if response.status() == 429 || body_text.contains("in progress") {
+                    error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
+                    if status == 429 || body_text.contains("in progress") {
                         return Err("Qwen chat is busy (another message in flight on this chat_id)".to_string());
                     }
-                    return Err(format!("Qwen API returned {}", response.status()));
+                    return Err(format!("Qwen API returned {}", status));
                 }
 
                 use std::io::Read;
@@ -484,16 +485,21 @@ async fn handler(
                 }
                 Ok(())
             }).await;
-            drop(tx);
             if let Err(e) = result {
                 let _ = tx.try_send(Err(e));
             }
+            drop(tx);
         }).detach();
 
         let has_tools = !tools.is_empty();
         let sse_stream = futures::stream::unfold(
             (rx, String::new(), String::new()),
-            move |(rx, mut buf, mut full_text)| async move {
+            move |(rx, mut buf, mut full_text)| {
+                let parent_store = parent_store.clone();
+                let tools = tools.clone();
+                let completion_id = completion_id.clone();
+                let model = model.clone();
+                async move {
                 match rx.recv().await {
                     Ok(Ok(chunk)) => {
                         buf.push_str(&chunk);
@@ -599,6 +605,7 @@ async fn handler(
                         Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text)))
                     }
                 }
+            }
             },
         );
 
@@ -627,13 +634,14 @@ async fn handler(
                 .map_err(|e| anyhow::anyhow!("Qwen API error: {}", e))?;
 
             if !(200..300).contains(&response.status()) {
+                let status = response.status();
                 let body_text = response.into_string().unwrap_or_default();
                 let preview: String = body_text.chars().take(500).collect();
-                error!(status = %response.status(), body_preview = %preview, "Qwen chat/completions returned error");
-                if response.status() == 429 || body_text.contains("in progress") {
+                error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
+                if status == 429 || body_text.contains("in progress") {
                     bail!("Qwen chat is busy (another message in flight on this chat_id)");
                 }
-                bail!("Qwen API returned {}", response.status());
+                bail!("Qwen API returned {}", status);
             }
 
             let body_text = response.into_string().map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
