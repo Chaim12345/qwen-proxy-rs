@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use futures::lock::Mutex;
 use futures::StreamExt;
 use http::{Method, StatusCode};
+use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -452,7 +453,7 @@ async fn handler(
                     .send_bytes(&body2)
                     .map_err(|e| format!("Qwen API error: {}", e))?;
 
-                if !response.status().is_success() {
+                if !(200..300).contains(&response.status()) {
                     let body_text = response.into_string().unwrap_or_default();
                     let preview: String = body_text.chars().take(500).collect();
                     error!(status = %response.status(), body_preview = %preview, "Qwen chat/completions returned error");
@@ -530,7 +531,7 @@ async fn handler(
                             }
                         }
                         let chunk_str = events.join("");
-                        Some((Ok::<_, std::io::Error>(Bytes::from(chunk_str)), (rx, buf, full_text)))
+                        Some((Ok::<_, std::io::Error>(Frame::new(Bytes::from(chunk_str))), (rx, buf, full_text)))
                     }
                     Ok(Err(err_str)) => {
                         let err_chunk = format!(
@@ -541,7 +542,7 @@ async fn handler(
                                 Some("stop")
                             )
                         );
-                        Some((Ok::<_, std::io::Error>(Bytes::from(err_chunk)), (rx, buf, full_text)))
+                        Some((Ok::<_, std::io::Error>(Frame::new(Bytes::from(err_chunk))), (rx, buf, full_text)))
                     }
                     Err(_) => {
                         let tc = detect_tool(&full_text, &tools);
@@ -595,7 +596,7 @@ async fn handler(
                             ));
                         }
 
-                        Some((Ok::<_, std::io::Error>(Bytes::from(final_chunks)), (rx, buf, full_text)))
+                        Some((Ok::<_, std::io::Error>(Frame::new(Bytes::from(final_chunks))), (rx, buf, full_text)))
                     }
                 }
             },
@@ -619,13 +620,13 @@ async fn handler(
         match smol::unblock(move || -> Result<String> {
             let mut resp = ureq::post(&qwen_url);
             for (k, v) in &headers {
-                resp = resp.header(k, v);
+                resp = resp.set(k, v);
             }
             let response = resp
                 .send_bytes(&body_bytes)
                 .map_err(|e| anyhow::anyhow!("Qwen API error: {}", e))?;
 
-            if !response.status().is_success() {
+            if !(200..300).contains(&response.status()) {
                 let body_text = response.into_string().unwrap_or_default();
                 let preview: String = body_text.chars().take(500).collect();
                 error!(status = %response.status(), body_preview = %preview, "Qwen chat/completions returned error");
@@ -849,14 +850,10 @@ async fn router(
             model_handler(model_id).map(|b| box_body(b))
         }
         (Method::POST, "/v1/chat/completions") | (Method::POST, "/v1/responses") => {
-            handler(req, st).await.unwrap_or_else(|_| {
-                Ok(internal_error("Internal error").map(|b| box_body(b)))
-            })?
+            handler(req, st).await.unwrap()
         }
         (Method::POST, "/v1/embeddings") => {
-            embeddings_handler(req).await.unwrap_or_else(|_| {
-                Ok(internal_error("Internal error").map(|b| box_body(b)))
-            })?
+            embeddings_handler(req).await.unwrap()
         }
         (Method::GET, "/") | (Method::GET, "") => {
             json_response(
@@ -866,9 +863,7 @@ async fn router(
         }
         _ => {
             if method == Method::POST {
-                handler(req, st).await.unwrap_or_else(|_| {
-                    Ok(internal_error("Internal error").map(|b| box_body(b)))
-                })?
+                handler(req, st).await.unwrap()
             } else {
                 not_found_response().map(|b| box_body(b))
             }
