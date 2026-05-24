@@ -3,7 +3,7 @@ mod session;
 
 use anyhow::{bail, Context, Result};
 use futures::lock::Mutex;
-use futures::StreamExt;
+
 use http::{Method, StatusCode};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -531,7 +531,7 @@ async fn handler(
                             }
                         }
                         let chunk_str = events.join("");
-                        Some((Ok::<_, std::io::Error>(Frame::new(Bytes::from(chunk_str))), (rx, buf, full_text)))
+                        Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(chunk_str))), (rx, buf, full_text)))
                     }
                     Ok(Err(err_str)) => {
                         let err_chunk = format!(
@@ -542,7 +542,7 @@ async fn handler(
                                 Some("stop")
                             )
                         );
-                        Some((Ok::<_, std::io::Error>(Frame::new(Bytes::from(err_chunk))), (rx, buf, full_text)))
+                        Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text)))
                     }
                     Err(_) => {
                         let tc = detect_tool(&full_text, &tools);
@@ -596,7 +596,7 @@ async fn handler(
                             ));
                         }
 
-                        Some((Ok::<_, std::io::Error>(Frame::new(Bytes::from(final_chunks))), (rx, buf, full_text)))
+                        Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text)))
                     }
                 }
             },
@@ -842,7 +842,7 @@ async fn router(
         ));
     }
 
-    let resp = match (method, path.as_str()) {
+    let resp = match (method.clone(), path.as_str()) {
         (Method::GET, "/health") => health_handler().map(|b| box_body(b)),
         (Method::GET, "/v1/models") => models_handler().map(|b| box_body(b)),
         (Method::GET, p) if p.starts_with("/v1/models/") => {
