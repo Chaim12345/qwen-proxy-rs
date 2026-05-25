@@ -525,7 +525,7 @@ async fn handler(
         let has_tools = !tools.is_empty();
         let sse_stream = futures::stream::unfold(
             (rx, String::new(), AccumulatedText::new(), false, false),
-            move |(rx, mut buf, mut full_text, emitted, done)| {
+            move |(rx, mut buf, mut full_text, tool_emitted, done)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let completion_id = completion_id.clone();
@@ -538,7 +538,6 @@ async fn handler(
                         Ok(Ok(chunk)) => {
                             buf.push_str(&chunk);
                             let mut oai_chunks: Vec<String> = Vec::new();
-                            let mut new_emitted = emitted;
                             loop {
                                 let nl = match buf.find('\n') {
                                     Some(p) => p,
@@ -566,7 +565,7 @@ async fn handler(
                                     break;
                                 }
                             }
-                            if !emitted {
+                            if !tool_emitted {
                                 let tc = detect_tool(full_text.full_answer(), &tools);
                                 if let Some(tc) = tc {
                                     info!(tool = %tc.name, "Detected tool call");
@@ -575,42 +574,42 @@ async fn handler(
                                     for s in build_tool_call_stream_chunks(&completion_id, &model, created, &tid, &tc.name, &args) {
                                         oai_chunks.push(s);
                                     }
-                                    new_emitted = true;
-                                } else if !has_tools {
-                                    let answer = full_text.full_answer().to_string();
-                                    let visible = client_visible_content(&answer, None, false);
-                                    let content_bytes = visible.as_bytes();
-                                    if !content_bytes.is_empty() {
-                                        let chunk_size = 16;
-                                        let mut first = true;
-                                        for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
-                                            let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
-                                            let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
-                                            if first {
-                                                oai_chunks.push(build_stream_chunk(
-                                                    &completion_id, &model, created,
-                                                    serde_json::json!({"role": "assistant", "content": piece.to_string()}),
-                                                    None,
-                                                ));
-                                                first = false;
-                                            } else {
-                                                oai_chunks.push(build_stream_chunk(
-                                                    &completion_id, &model, created,
-                                                    serde_json::json!({"content": piece.to_string()}),
-                                                    None,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    new_emitted = !oai_chunks.is_empty();
+                                    let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false)));
                                 }
                             }
-                            let out = if new_emitted {
-                                oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>()
-                            } else {
-                                String::new()
-                            };
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, new_emitted, false)))
+                            if !has_tools {
+                                let answer = full_text.full_answer().to_string();
+                                let visible = client_visible_content(&answer, None, false);
+                                let content_bytes = visible.as_bytes();
+                                if !content_bytes.is_empty() {
+                                    let chunk_size = 16;
+                                    let mut first = true;
+                                    for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
+                                        let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
+                                        let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
+                                        if first {
+                                            oai_chunks.push(build_stream_chunk(
+                                                &completion_id, &model, created,
+                                                serde_json::json!({"role": "assistant", "content": piece.to_string()}),
+                                                None,
+                                            ));
+                                            first = false;
+                                        } else {
+                                            oai_chunks.push(build_stream_chunk(
+                                                &completion_id, &model, created,
+                                                serde_json::json!({"content": piece.to_string()}),
+                                                None,
+                                            ));
+                                        }
+                                    }
+                                }
+                                if !oai_chunks.is_empty() {
+                                    let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, false, false)));
+                                }
+                            }
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, false)))
                         }
                         Ok(Err(err_str)) => {
                             let err_chunk = format!(
@@ -620,11 +619,11 @@ async fn handler(
                                     Some("stop"),
                                 )
                             );
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, emitted, true)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, true)))
                         }
                         Err(_) => {
                             let mut final_chunks = String::new();
-                            if !emitted {
+                            if !tool_emitted {
                                 let answer = full_text.full_answer().to_string();
                                 let tc = detect_tool(&answer, &tools);
                                 if let Some(tc) = tc {
@@ -648,7 +647,7 @@ async fn handler(
                                 }
                             }
                             final_chunks.push_str("data: [DONE]\n\n");
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, emitted, true)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, true)))
                         }
                     }
                 }
