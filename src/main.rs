@@ -2,7 +2,6 @@ mod qwen;
 mod session;
 
 use anyhow::{bail, Context, Result};
-use futures::lock::Mutex;
 
 use http::{Method, StatusCode};
 use http_body::Frame;
@@ -18,7 +17,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, error, info};
 
 const MODEL_NAME: &str = "qwen3.7-max";
@@ -267,7 +265,7 @@ fn sse_line_to_openai(
     completion_id: &str,
     model: &str,
     created: i64,
-    has_tools: bool,
+    _has_tools: bool,
     full_text: &mut AccumulatedText,
 ) -> Option<String> {
     let data = parse_qwen_sse_line(line)?;
@@ -559,7 +557,7 @@ async fn handler(
                                     }
                                     if let Some(delta) = extract_qwen_sse_delta(&ch) {
                                         full_text.append(&delta);
-                                        if delta.phase == QwenPhase::Answer || delta.phase == QwenPhase::Other(_) {
+                                            if matches!(delta.phase, QwenPhase::Answer | QwenPhase::Other(_)) {
                                             if !delta.text.is_empty() {
                                                 oai_chunks.push(build_stream_chunk(
                                                     &completion_id, &model, created,
