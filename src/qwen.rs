@@ -104,6 +104,39 @@ pub fn parse_qwen_upstream_error(raw: &str) -> Option<String> {
     Some(msg.to_string())
 }
 
+/// Detect tool-related error messages in Qwen response text.
+/// When the Qwen model can't use a tool, it returns text like
+/// "Tool calculator does not exists" or "无法使用该工具".
+pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+
+    if text.contains("Tool ") && (text.contains(" does not exist") || text.contains(" does not exists")) {
+        let end = text.find('.').unwrap_or(text.len());
+        return Some(text[..end].to_string());
+    }
+
+    if text.contains("cannot use") || text.contains("can't use") || text.contains("unable to use") {
+        if text.contains("tool") {
+            let end = text.find('.').unwrap_or(text.len().min(200));
+            return Some(text[..end].to_string());
+        }
+    }
+
+    if text.contains("tool not found") || text.contains("tool_not_found") {
+        let end = text.find('.').unwrap_or(text.len().min(200));
+        return Some(text[..end].to_string());
+    }
+
+    if text.len() < 100 && (text.contains("抱歉") || text.contains("sorry") && text.contains("tool")) {
+        let end = text.find('.').unwrap_or(text.len().min(200));
+        return Some(text[..end].to_string());
+    }
+
+    None
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum QwenPhase {
     ThinkingSummary,

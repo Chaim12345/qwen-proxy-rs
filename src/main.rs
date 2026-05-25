@@ -115,6 +115,17 @@ fn internal_error(message: impl Into<String>) -> Response<Full<Bytes>> {
     )
 }
 
+fn tool_error(message: impl Into<String>, tools: &[serde_json::Value]) -> Response<Full<Bytes>> {
+    let mut err = serde_json::json!({
+        "message": message.into(),
+        "type": "server_error",
+    });
+    if !tools.is_empty() {
+        err["available_tools"] = serde_json::json!(tools);
+    }
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({"error": err}))
+}
+
 fn not_found_response() -> Response<Full<Bytes>> {
     json_response(
         StatusCode::NOT_FOUND,
@@ -625,6 +636,20 @@ async fn handler(
                             let mut final_chunks = String::new();
                             if !tool_emitted {
                                 let answer = full_text.full_answer().to_string();
+                                if has_tools {
+                                    if let Some(err_msg) = detect_qwen_tool_error(&answer) {
+                                        error!(error = %err_msg, "Qwen returned tool error in stream");
+                                        final_chunks.push_str(&format!(
+                                            "data: {}\n\n",
+                                            build_stream_chunk(&completion_id, &model, created,
+                                                serde_json::json!({"content": format!("[Tool Error: {}]", err_msg)}),
+                                                Some("stop"),
+                                            )
+                                        ));
+                                        final_chunks.push_str("data: [DONE]\n\n");
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, true)));
+                                    }
+                                }
                                 let tc = detect_tool(&answer, &tools);
                                 if let Some(tc) = tc {
                                     info!(tool = %tc.name, "Detected tool call");
@@ -718,6 +743,58 @@ async fn handler(
                             "rate_limit_exceeded",
                             None,
                             Some("rate_limit"),
+                        ).map(|b| box_body(b)));
+                    }
+                }
+
+                if full_text.is_empty() && !tools.is_empty() {
+                    if let Some(tc) = detect_tool(&body_text, &tools) {
+                        info!(tool = %tc.name, "Detected tool call in raw body");
+                        let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
+                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+                        let resp_value = serde_json::json!({
+                            "id": completion_id,
+                            "object": "chat.completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": tool_call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.name,
+                                            "arguments": args
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": 0,
+                                "total_tokens": prompt_tokens
+                            }
+                        });
+                        info!(len = 0, "Returning tool call from raw body");
+                        return Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)));
+                    }
+                }
+
+                if !full_text.is_empty() && !tools.is_empty() {
+                    if let Some(err_msg) = detect_qwen_tool_error(&full_text) {
+                        error!(error = %err_msg, "Qwen returned tool error in response text");
+                        let mut err = serde_json::json!({
+                            "message": err_msg,
+                            "type": "invalid_request_error",
+                        });
+                        err["available_tools"] = serde_json::json!(tools);
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            &serde_json::json!({"error": err}),
                         ).map(|b| box_body(b)));
                     }
                 }
