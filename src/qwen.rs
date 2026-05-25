@@ -114,6 +114,7 @@ pub enum QwenPhase {
 }
 
 impl QwenPhase {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         match self {
             QwenPhase::ThinkingSummary => "thinking_summary",

@@ -260,6 +260,7 @@ fn append_sse_delta(acc: &mut AccumulatedText, ch: &serde_json::Value) {
     }
 }
 
+#[allow(dead_code)]
 fn sse_line_to_openai(
     line: &str,
     completion_id: &str,
