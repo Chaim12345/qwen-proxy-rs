@@ -607,8 +607,10 @@ async fn handler(
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, true)))
                         }
                         Err(_) => {
-                            let tc = detect_tool(full_text.full_answer(), &tools);
                             let mut final_chunks = String::new();
+                            let answer = full_text.full_answer().to_string();
+                            let already_emitted = !answer.is_empty();
+                            let tc = detect_tool(&answer, &tools);
                             if let Some(tc) = tc {
                                 info!(tool = %tc.name, "Detected tool call");
                                 let tid = format!("call_{}", uuid::Uuid::new_v4());
@@ -616,38 +618,17 @@ async fn handler(
                                 for s in build_tool_call_stream_chunks(&completion_id, &model, created, &tid, &tc.name, &args) {
                                     final_chunks.push_str(&format!("data: {}\n\n", s));
                                 }
-                            } else {
-                                let visible = client_visible_content(full_text.full_answer(), None, has_tools);
-                                let content_bytes = visible.as_bytes();
-                                if !content_bytes.is_empty() {
-                                    final_chunks.push_str(&format!(
-                                        "data: {}\n\n",
-                                        build_stream_chunk(&completion_id, &model, created,
-                                            serde_json::json!({"role": "assistant", "content": ""}),
-                                            None,
-                                        )
-                                    ));
-                                    let chunk_size = 16;
-                                    for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
-                                        let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
-                                        let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
-                                        final_chunks.push_str(&format!(
-                                            "data: {}\n\n",
-                                            build_stream_chunk(&completion_id, &model, created,
-                                                serde_json::json!({"content": piece.to_string()}),
-                                                None,
-                                            )
-                                        ));
-                                    }
-                                }
+                            } else if !already_emitted {
+                                let visible = client_visible_content(&answer, None, has_tools);
                                 final_chunks.push_str(&format!(
-                                    "data: {}\n\ndata: [DONE]\n\n",
+                                    "data: {}\n\n",
                                     build_stream_chunk(&completion_id, &model, created,
-                                        serde_json::json!({}),
+                                        serde_json::json!({"role": "assistant", "content": visible}),
                                         Some("stop"),
                                     )
                                 ));
                             }
+                            final_chunks.push_str("data: [DONE]\n\n");
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, true)))
                         }
                     }
