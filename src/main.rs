@@ -491,8 +491,8 @@ async fn handler(
 
         let has_tools = !tools.is_empty();
         let sse_stream = futures::stream::unfold(
-            (rx, String::new(), AccumulatedText::new(), false, false, false),
-            move |(rx, mut buf, mut full_text, tool_emitted, mut content_emitted, done)| {
+            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize),
+            move |(rx, mut buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let completion_id = completion_id.clone();
@@ -544,7 +544,7 @@ async fn handler(
                                         oai_chunks.push(s);
                                     }
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false)));
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len)));
                                 }
                                 if has_tools {
                                     let answer = full_text.full_answer().to_string();
@@ -557,13 +557,13 @@ async fn handler(
                             if !tool_emitted && (!has_tools || content_emitted) {
                                 let answer = full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
-                                let content_bytes = visible.as_bytes();
-                                if !content_bytes.is_empty() {
+                                if visible.len() > prev_len {
+                                    let delta = &visible[prev_len..];
                                     let chunk_size = 16;
-                                    let mut first = true;
-                                    for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
-                                        let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
-                                        let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
+                                    let mut first = prev_len == 0;
+                                    for chunk_start in (0..delta.len()).step_by(chunk_size) {
+                                        let chunk_end = std::cmp::min(chunk_start + chunk_size, delta.len());
+                                        let piece = &delta[chunk_start..chunk_end];
                                         if first {
                                             oai_chunks.push(build_stream_chunk(
                                                 &completion_id, &model, created,
@@ -579,13 +579,14 @@ async fn handler(
                                             ));
                                         }
                                     }
+                                    prev_len = visible.len();
                                 }
                                 if !oai_chunks.is_empty() {
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, false, content_emitted, false)));
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, false, content_emitted, false, prev_len)));
                                 }
                             }
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len)))
                         }
                         Ok(Err(err_str)) => {
                             let err_chunk = format!(
@@ -595,7 +596,7 @@ async fn handler(
                                     Some("stop"),
                                 )
                             );
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len)))
                         }
                         Err(_) => {
                             let mut final_chunks = String::new();
@@ -612,7 +613,7 @@ async fn handler(
                                             )
                                         ));
                                         final_chunks.push_str("data: [DONE]\n\n");
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true)));
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len)));
                                     }
                                 }
                                 let tc = detect_tool(&answer, &tools);
@@ -637,7 +638,7 @@ async fn handler(
                                 }
                             }
                             final_chunks.push_str("data: [DONE]\n\n");
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len)))
                         }
                     }
                 }
