@@ -37,11 +37,10 @@ fn sanitize_tool_args(args: &Value) -> Value {
 /// True when text still looks like a tool call after normalization (even if parse failed).
 pub fn looks_like_tool_call_attempt(text: &str) -> bool {
     let cleaned = normalize_tool_call_text(text);
-    cleaned.contains("\"tool\":")
+    cleaned.contains("```")
+        || cleaned.contains("\"tool\":")
         || cleaned.contains("\"tool_calls\":")
         || cleaned.contains("\"function\":")
-        || cleaned.contains("```json")
-        || cleaned.contains("```\n{")
 }
 
 /// Text safe to return as assistant `content` to OpenAI clients (never leak raw tool JSON).
@@ -104,46 +103,209 @@ pub fn parse_qwen_upstream_error(raw: &str) -> Option<String> {
     Some(msg.to_string())
 }
 
-pub fn extract_qwen_sse_delta(ch: &Value) -> Option<String> {
-    let phase = ch
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|c| c.first())
-        .and_then(|c| c.get("delta"))
-        .and_then(|d| d.get("phase"))
-        .and_then(|p| p.as_str())
-        .or_else(|| ch.get("phase").and_then(|p| p.as_str()))
-        .unwrap_or("");
+/// Strip markdown code block fences from JSON text if present.
+/// Handles ```json ... ``` and ``` ... ``` patterns.
+pub fn strip_json_codeblock(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(caps) = MARKDOWN_CODE_RE.captures(trimmed) {
+        if let Some(inner) = caps.get(1) {
+            return inner.as_str().trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
 
-    if phase == "thinking_summary" || phase == "thinking" || phase == "search" {
+/// Process response content for structured output (response_format).
+/// Strips code blocks and validates JSON for json_object/json_schema.
+pub fn process_structured_output(
+    text: &str,
+    rf: Option<&Value>,
+) -> Result<String, String> {
+    let rf = match rf {
+        Some(r) => r,
+        None => return Ok(text.to_string()),
+    };
+    let rf_type = rf.get("type").and_then(|t| t.as_str());
+    if rf_type != Some("json_schema") && rf_type != Some("json_object") {
+        return Ok(text.to_string());
+    }
+    let cleaned = strip_json_codeblock(text);
+    if serde_json::from_str::<Value>(&cleaned).is_err() {
+        return Err(format!(
+            "Response is not valid JSON despite response_format. Got: {}",
+            cleaned.chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(cleaned)
+}
+
+/// Detect tool-related error messages in Qwen response text.
+/// When the Qwen model can't use a tool, it returns text like
+/// "Tool calculator does not exists" or "无法使用该工具".
+pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
+    if text.is_empty() {
         return None;
     }
 
+    if text.contains("Tool ") && (text.contains(" does not exist") || text.contains(" does not exists")) {
+        let end = text.find('.').unwrap_or(text.len());
+        return Some(text[..end].to_string());
+    }
+
+    if text.contains("cannot use") || text.contains("can't use") || text.contains("unable to use") {
+        if text.contains("tool") {
+            let end = text.find('.').unwrap_or(text.len().min(200));
+            return Some(text[..end].to_string());
+        }
+    }
+
+    if text.contains("tool not found") || text.contains("tool_not_found") {
+        let end = text.find('.').unwrap_or(text.len().min(200));
+        return Some(text[..end].to_string());
+    }
+
+    if text.len() < 100 && (text.contains("抱歉") || (text.contains("sorry") && text.contains("tool"))) {
+        let end = text.find('.').unwrap_or(text.len().min(200));
+        return Some(text[..end].to_string());
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum QwenPhase {
+    ThinkingSummary,
+    Thinking,
+    Search,
+    Answer,
+    Other(String),
+}
+
+pub struct QwenSseDelta {
+    pub phase: QwenPhase,
+    pub text: String,
+    pub finished: bool,
+}
+
+pub struct AccumulatedText {
+    pub thinking: String,
+    pub answer: String,
+}
+
+impl AccumulatedText {
+    pub fn new() -> Self {
+        AccumulatedText { thinking: String::new(), answer: String::new() }
+    }
+
+    pub fn append(&mut self, delta: &QwenSseDelta) {
+        match delta.phase {
+            QwenPhase::ThinkingSummary | QwenPhase::Thinking => {
+                if !delta.text.is_empty() {
+                    if !self.thinking.is_empty() {
+                        self.thinking.push('\n');
+                    }
+                    self.thinking.push_str(&delta.text);
+                }
+            }
+            QwenPhase::Answer | QwenPhase::Other(_) => {
+                self.answer.push_str(&delta.text);
+            }
+            QwenPhase::Search => {}
+        }
+    }
+
+    pub fn full_answer(&self) -> &str {
+        &self.answer
+    }
+
+    pub fn thinking(&self) -> &str {
+        &self.thinking
+    }
+}
+
+pub fn extract_qwen_sse_delta(ch: &Value) -> Option<QwenSseDelta> {
     let delta = ch
         .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|c| c.first())
         .and_then(|c| c.get("delta"));
 
-    let mut text = extract_string_value(
-        delta
-            .and_then(|d| d.get("content"))
-            .unwrap_or(&Value::Null),
-    );
-    if text.is_empty() {
-        text = ch
-            .get("response")
-            .map(|r| extract_string_value(r.get("content").unwrap_or(&Value::Null)))
-            .unwrap_or_default();
-    }
-    if text.is_empty() {
-        text = extract_string_value(ch.get("content").unwrap_or(&Value::Null));
+    let phase_str = delta
+        .as_ref()
+        .and_then(|d| d.get("phase"))
+        .and_then(|p| p.as_str())
+        .or_else(|| ch.get("phase").and_then(|p| p.as_str()))
+        .unwrap_or("");
+
+    let phase = match phase_str {
+        "thinking_summary" => QwenPhase::ThinkingSummary,
+        "thinking" => QwenPhase::Thinking,
+        "search" => QwenPhase::Search,
+        "answer" => QwenPhase::Answer,
+        other => if other.is_empty() { QwenPhase::Answer } else { QwenPhase::Other(other.to_string()) },
+    };
+
+    let finished = delta
+        .as_ref()
+        .and_then(|d| d.get("status"))
+        .and_then(|s| s.as_str())
+        .map(|s| s == "finished")
+        .unwrap_or(false);
+
+    let mut text = String::new();
+
+    if phase == QwenPhase::ThinkingSummary {
+        if let Some(extra) = delta.as_ref().and_then(|d| d.get("extra")) {
+            if let Some(title) = extra.get("summary_title").and_then(|s| s.get("content")) {
+                if let Some(arr) = title.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            text.push_str(s);
+                        }
+                    }
+                } else if let Some(s) = title.as_str() {
+                    text.push_str(s);
+                }
+            }
+            if let Some(thought) = extra.get("summary_thought").and_then(|s| s.get("content")) {
+                if let Some(arr) = thought.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(s);
+                        }
+                    }
+                } else if let Some(s) = thought.as_str() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(s);
+                }
+            }
+        }
+    } else {
+        text = extract_string_value(
+            delta
+                .and_then(|d| d.get("content"))
+                .unwrap_or(&Value::Null),
+        );
+        if text.is_empty() {
+            text = ch
+                .get("response")
+                .map(|r| extract_string_value(r.get("content").unwrap_or(&Value::Null)))
+                .unwrap_or_default();
+        }
+        if text.is_empty() {
+            text = extract_string_value(ch.get("content").unwrap_or(&Value::Null));
+        }
     }
 
-    if text.is_empty() {
+    if text.is_empty() && !finished {
         None
     } else {
-        Some(text)
+        Some(QwenSseDelta { phase, text, finished })
     }
 }
 
@@ -163,6 +325,7 @@ fn extract_json_blocks(text: &str) -> Vec<String> {
 }
 
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub name: String,
     pub args: serde_json::Value,
@@ -277,6 +440,7 @@ pub fn build_message(v: &Value) -> String {
             if msg["role"] == "tool" {
                 let tool_result = message_content_to_string(&msg["content"]);
                 parts.push(format!("TOOL RESULT: {}", tool_result));
+                continue;
             }
         }
     }
@@ -299,15 +463,11 @@ pub fn build_message(v: &Value) -> String {
     }
 
     if has_tools {
-        result.push_str("\n\n⚠️ IMPORTANT TOOL USE INSTRUCTIONS:\n");
-        result.push_str("When you need to use a tool, you MUST output EXACTLY this JSON format and NOTHING ELSE:\n");
-        result.push_str("{\"tool\":\"tool_name\",\"args\":{\"param1\":\"value1\"}}\n");
-        result.push_str(
-            "Do NOT wrap it in markdown. Do NOT add any explanation text before or after.\n",
-        );
-        result.push_str(
-            "The JSON must be on a single line. Output ONLY the tool JSON when using a tool.\n",
-        );
+        result.push_str("\n\n## Tool Use Format\n");
+        result.push_str("When you need to call a tool, output a fenced code block with language `json`:\n");
+        result.push_str("```json\n{\"tool\":\"tool_name\",\"args\":{...}}\n```\n");
+        result.push_str("Always wrap the tool JSON in a markdown code block. Never output raw JSON outside a code block.\n");
+        result.push_str("Never add text after the code block. The code block must be the last thing you output.\n");
     }
 
     result
@@ -429,7 +589,8 @@ fn accept_tool_call(tc: ToolCall, tool_names: &[&str]) -> Option<ToolCall> {
 /// 1. Markdown code blocks containing JSON
 /// 2. Proper JSON parsing with string/escape handling
 /// 3. Line-by-line scanning for tool-like patterns
-pub fn detect_tool(text: &str, tool_defs: &[Value]) -> Option<ToolCall> {
+/// Returns all unique tool calls found.
+pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     let normalized = normalize_tool_call_text(text);
     let tool_names: Vec<&str> = tool_defs
         .iter()
@@ -443,11 +604,19 @@ pub fn detect_tool(text: &str, tool_defs: &[Value]) -> Option<ToolCall> {
         "Starting tool detection"
     );
 
+    let mut found: Vec<ToolCall> = Vec::new();
+
+    let mut add_unique = |tc: ToolCall| {
+        if !found.contains(&tc) {
+            found.push(tc);
+        }
+    };
+
     for cap in MARKDOWN_CODE_RE.captures_iter(&normalized) {
         let json_str = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
         if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
             debug!(strategy = "markdown_code_block", tool = %tc.name, "Tool detected");
-            return Some(tc);
+            add_unique(tc);
         }
     }
 
@@ -455,13 +624,13 @@ pub fn detect_tool(text: &str, tool_defs: &[Value]) -> Option<ToolCall> {
     for json_str in blocks.iter().filter(|b| b.contains("\"tool\"")) {
         if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
             debug!(strategy = "json_object_scan", tool = %tc.name, "Tool detected");
-            return Some(tc);
+            add_unique(tc);
         }
     }
     for json_str in &blocks {
         if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
             debug!(strategy = "json_object_scan_fallback", tool = %tc.name, "Tool detected");
-            return Some(tc);
+            add_unique(tc);
         }
     }
 
@@ -473,15 +642,19 @@ pub fn detect_tool(text: &str, tool_defs: &[Value]) -> Option<ToolCall> {
                     let json_str = &trimmed[start..=end];
                     if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
                         debug!(strategy = "line_scan", tool = %tc.name, "Tool detected");
-                        return Some(tc);
+                        add_unique(tc);
                     }
                 }
             }
         }
     }
 
-    debug!("No tool call detected in text");
-    None
+    if found.is_empty() {
+        debug!("No tool call detected in text");
+    } else {
+        debug!(count = found.len(), "Tool calls detected");
+    }
+    found
 }
 
 
@@ -503,32 +676,36 @@ mod tests {
     fn test_detect_tool_simple() {
         let text = r#"{"tool":"write","args":{"path":"test.txt","content":"hello"}}"#;
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool");
-        assert_eq!(tc.name, "write");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write");
     }
 
     #[test]
     fn test_detect_tool_in_markdown() {
         let text = "Here is the tool call:\n```json\n{\"tool\":\"bash\",\"args\":{\"command\":\"ls\"}}\n```\nDone.";
         let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool in markdown");
-        assert_eq!(tc.name, "bash");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "bash");
     }
 
     #[test]
     fn test_detect_tool_embedded_in_text() {
         let text = "I've created the file. {\"tool\":\"write\",\"args\":{\"path\":\"demo.py\",\"content\":\"print('hi')\"}} The file is ready.";
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect embedded tool");
-        assert_eq!(tc.name, "write");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write");
     }
 
     #[test]
     fn test_detect_tool_unknown_tool() {
         let text = r#"{"tool":"unknown","args":{}}"#;
         let tools: Vec<Value> = vec![];
-        let tc = detect_tool(text, &tools).expect("should detect unknown tool");
-        assert_eq!(tc.name, "unknown");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "unknown");
     }
 
     #[test]
@@ -536,10 +713,11 @@ mod tests {
         // This is the key test - args contain braces inside a string value
         let text = r#"{"tool":"bash","args":{"command":"echo {hello}"}}"#;
         let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
-        let tc =
-            detect_tool(text, &tools).expect("should detect tool with nested braces in string");
-        assert_eq!(tc.name, "bash");
-        assert_eq!(tc.args["command"], "echo {hello}");
+        let tcs =
+            detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "bash");
+        assert_eq!(tcs[0].args["command"], "echo {hello}");
     }
 
     #[test]
@@ -547,17 +725,32 @@ mod tests {
         let text =
             r#"{"tool":"write","args":{"path":"test.json","content":"{\"key\": \"value\"}"}}"#;
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool with deeply nested JSON");
-        assert_eq!(tc.name, "write");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write");
     }
 
     #[test]
     fn test_detect_tool_escaped_quotes() {
         let text = r#"{"tool":"write","args":{"content":"He said \"hello\""}}"#;
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool with escaped quotes");
-        assert_eq!(tc.name, "write");
-        assert_eq!(tc.args["content"], "He said \"hello\"");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write");
+        assert_eq!(tcs[0].args["content"], "He said \"hello\"");
+    }
+
+    #[test]
+    fn test_detect_multiple_tools() {
+        let text = "First I'll read the file:\n```json\n{\"tool\":\"read\",\"args\":{\"path\":\"test.txt\"}}\n```\nThen I'll write:\n```json\n{\"tool\":\"write\",\"args\":{\"path\":\"out.txt\",\"content\":\"done\"}}\n```\nFinished.";
+        let tools = vec![
+            serde_json::json!({"name":"read","description":"","parameters":{}}),
+            serde_json::json!({"name":"write","description":"","parameters":{}}),
+        ];
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 2, "should detect both tool calls");
+        assert_eq!(tcs[0].name, "read");
+        assert_eq!(tcs[1].name, "write");
     }
 
     #[test]
@@ -573,8 +766,12 @@ mod tests {
         assert!(msg.contains("You are helpful"), "system prompt included");
         assert!(msg.contains("USER: Hello"), "user message included");
         assert!(
-            msg.contains("TOOL USE INSTRUCTIONS"),
+            msg.contains("Tool Use Format"),
             "tool instructions present"
+        );
+        assert!(
+            msg.contains("```json"),
+            "code block instruction present"
         );
     }
 
@@ -589,9 +786,10 @@ mod tests {
     fn test_detect_tool_spinner_in_args() {
         let text = r#"{"tool":"bash","args":{"⠧ Thinking...command":"echo TOOLCALL-LIVE"}}"#;
         let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool with spinner in args");
-        assert_eq!(tc.name, "bash");
-        assert_eq!(tc.args["command"], "echo TOOLCALL-LIVE");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1, "should detect tool with spinner in args");
+        assert_eq!(tcs[0].name, "bash");
+        assert_eq!(tcs[0].args["command"], "echo TOOLCALL-LIVE");
     }
 
     #[test]
@@ -599,6 +797,14 @@ mod tests {
         let raw = r#"{"tool":"bash","args":{"command":"ls"}}"#;
         assert_eq!(client_visible_content(raw, None, true), "");
         assert_eq!(client_visible_content("hello", None, true), "hello");
+    }
+
+    #[test]
+    fn test_looks_like_tool_call_backtick() {
+        assert!(looks_like_tool_call_attempt("```json\n{\"tool\":\"bash\"}"));
+        assert!(looks_like_tool_call_attempt("```"));
+        assert!(looks_like_tool_call_attempt("text ```json more"));
+        assert!(!looks_like_tool_call_attempt("hello world"));
     }
 
     #[test]
@@ -614,7 +820,9 @@ mod tests {
             "response": {"content": "Hello"},
             "content": ""
         });
-        assert_eq!(extract_qwen_sse_delta(&ch).as_deref(), Some("Hello"));
+        let delta = extract_qwen_sse_delta(&ch);
+        assert!(delta.is_some());
+        assert_eq!(delta.unwrap().text, "Hello");
     }
 
     #[test]
@@ -632,7 +840,9 @@ mod tests {
             "choices": [{"delta": {"phase": "answer"}}],
             "content": "world"
         });
-        assert_eq!(extract_qwen_sse_delta(&ch).as_deref(), Some("world"));
+        let delta = extract_qwen_sse_delta(&ch);
+        assert!(delta.is_some());
+        assert_eq!(delta.unwrap().text, "world");
     }
 
 }

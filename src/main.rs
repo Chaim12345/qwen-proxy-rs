@@ -2,56 +2,30 @@ mod qwen;
 mod session;
 
 use anyhow::{bail, Context, Result};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Json,
-    },
-    routing::{get, post},
-    Router,
-};
-use futures::StreamExt;
+
+use http::{Method, StatusCode};
+use http_body::Frame;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
 use qwen::*;
 use session::SessionManager;
+use smol_hyper;
 use std::collections::hash_map::DefaultHasher;
+use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
-
-use reqwest::header::{HeaderMap, HeaderValue};
-use tower_http::cors::{Any, CorsLayer};
-
-fn qwen_default_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "user-agent",
-        HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ),
-    );
-    headers.insert("referer", HeaderValue::from_static("https://chat.qwen.ai/"));
-    headers.insert("source", HeaderValue::from_static("web"));
-    headers.insert("version", HeaderValue::from_static("0.8.0"));
-    headers
-}
-
-fn qwen_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .default_headers(qwen_default_headers())
-        .build()
-        .context("Failed to build HTTP client")
-}
+use tracing::{debug, error, info, info_span, Instrument};
 
 const MODEL_NAME: &str = "qwen3.7-max";
 const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
 
 struct AppState {
     sessions: SessionManager,
-    http: reqwest::Client,
     token: String,
 }
 
@@ -94,13 +68,23 @@ fn model_info(id: &str) -> serde_json::Value {
     })
 }
 
-fn openai_error(
+fn json_response<T: serde::Serialize>(status: StatusCode, body: &T) -> Response<Full<Bytes>> {
+    let json = serde_json::to_string(body).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("content-length", json.len().to_string())
+        .body(Full::new(Bytes::from(json)))
+        .unwrap()
+}
+
+fn openai_error_response(
     status: StatusCode,
     message: impl Into<String>,
     r#type: &str,
     param: Option<&str>,
     code: Option<&str>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response<Full<Bytes>> {
     let mut err = serde_json::json!({
         "message": message.into(),
         "type": r#type,
@@ -111,16 +95,33 @@ fn openai_error(
     if let Some(c) = code {
         err["code"] = c.into();
     }
-    (status, Json(serde_json::json!({"error": err})))
+    json_response(status, &serde_json::json!({"error": err}))
 }
 
-fn bad_request(message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
-    openai_error(
+fn bad_request(message: impl Into<String>) -> Response<Full<Bytes>> {
+    openai_error_response(
         StatusCode::BAD_REQUEST,
         message,
         "invalid_request_error",
         None,
         None,
+    )
+}
+
+fn internal_error(message: impl Into<String>) -> Response<Full<Bytes>> {
+    openai_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        message,
+        "server_error",
+        None,
+        None,
+    )
+}
+
+fn not_found_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_FOUND,
+        &serde_json::json!({"error": {"message": "Not found", "type": "not_found"}}),
     )
 }
 
@@ -130,13 +131,14 @@ const MODELS_JSON: &str = r#"{"object":"list","data":[
 {"id":"qwen3.6-max-preview","object":"model","created":1700000000,"owned_by":"qwen","permission":[],"root":"qwen3.6-max-preview","parent":null}
 ]}"#;
 
-async fn models_handler() -> Json<serde_json::Value> {
-    Json(serde_json::from_str(MODELS_JSON).unwrap())
+fn models_handler() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::OK,
+        &serde_json::from_str::<serde_json::Value>(MODELS_JSON).unwrap(),
+    )
 }
 
-async fn model_handler(
-    axum::extract::Path(model_id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+fn model_handler(model_id: &str) -> Response<Full<Bytes>> {
     if model_id == MODEL_NAME
         || model_id == "qwen3.6-plus"
         || model_id == "qwen3.6-max-preview"
@@ -144,54 +146,29 @@ async fn model_handler(
         || model_id == "gpt-4o"
         || model_id == "gpt-3.5-turbo"
     {
-        let resolved_id =
-            if model_id == "gpt-4" || model_id == "gpt-4o" || model_id == "gpt-3.5-turbo" {
-                MODEL_NAME
-            } else {
-                &model_id
-            };
-        Ok(Json(model_info(resolved_id)))
+        let resolved_id = if model_id == "gpt-4" || model_id == "gpt-4o" || model_id == "gpt-3.5-turbo"
+        {
+            MODEL_NAME
+        } else {
+            model_id
+        };
+        json_response(StatusCode::OK, &model_info(resolved_id))
     } else {
-        Err(openai_error(
+        openai_error_response(
             StatusCode::NOT_FOUND,
             format!("Model '{}' not found", model_id),
             "invalid_request_error",
             Some("model"),
             Some("model_not_found"),
-        ))
+        )
     }
 }
 
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok", "model": MODEL_NAME}))
-}
-
-async fn embeddings_handler(
-    body: axum::body::Bytes,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let v: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| bad_request(format!("Invalid JSON: {}", e)))?;
-
-    let input = v.get("input").and_then(|i| i.as_str()).unwrap_or("");
-    let dims = v.get("dimensions").and_then(|d| d.as_u64()).unwrap_or(1536) as usize;
-    let embedding: Vec<f64> = vec![0.0; dims];
-    let tokens = std::cmp::max(1, input.len() / 4);
-
-    let model = request_model(&v);
-
-    Ok(Json(serde_json::json!({
-        "object": "list",
-        "data": [{
-            "object": "embedding",
-            "embedding": embedding,
-            "index": 0
-        }],
-        "model": model,
-        "usage": {
-            "prompt_tokens": tokens,
-            "total_tokens": tokens
-        }
-    })))
+fn health_handler() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({"status": "ok", "model": MODEL_NAME}),
+    )
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -231,6 +208,7 @@ fn build_tool_call_stream_chunks(
     id: &str,
     model: &str,
     created: i64,
+    index: usize,
     tool_call_id: &str,
     name: &str,
     args_json: &str,
@@ -244,7 +222,7 @@ fn build_tool_call_stream_chunks(
             "role": "assistant",
             "content": null,
             "tool_calls": [{
-                "index": 0,
+                "index": index,
                 "id": tool_call_id,
                 "type": "function",
                 "function": { "name": name, "arguments": "" }
@@ -264,7 +242,7 @@ fn build_tool_call_stream_chunks(
             created,
             serde_json::json!({
                 "tool_calls": [{
-                    "index": 0,
+                    "index": index,
                     "function": { "arguments": arg_piece.to_string() }
                 }]
             }),
@@ -273,22 +251,19 @@ fn build_tool_call_stream_chunks(
     }
 
     chunks.push(build_stream_chunk(
-        id,
-        model,
-        created,
+        id, model, created,
         serde_json::json!({}),
         Some("tool_calls"),
     ));
     chunks
 }
 
-fn append_sse_delta(full_text: &mut String, ch: &serde_json::Value) {
+fn append_sse_delta(acc: &mut AccumulatedText, ch: &serde_json::Value) {
     if let Some(delta) = extract_qwen_sse_delta(ch) {
-        full_text.push_str(&delta);
+        acc.append(&delta);
     }
 }
 
-/// Hash of the request `tools` array so identical prompts with different tool sets stay isolated.
 fn tools_fingerprint(v: &serde_json::Value) -> u64 {
     let Some(tools) = v.get("tools").and_then(|t| t.as_array()) else {
         return 0;
@@ -311,7 +286,6 @@ fn session_tools_suffix(v: &serde_json::Value) -> String {
     }
 }
 
-/// Stable key so multi-turn requests reuse the same Qwen chat_id.
 fn client_session_key(v: &serde_json::Value) -> String {
     let tools_suffix = session_tools_suffix(v);
     if let Some(user) = v.get("user").and_then(|u| u.as_str()) {
@@ -350,53 +324,98 @@ fn client_session_key(v: &serde_json::Value) -> String {
     format!("ephemeral:{}", uuid::Uuid::new_v4())
 }
 
-async fn handler(
-    State(st): State<Arc<AppState>>,
-    body: axum::body::Bytes,
-) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
-    let json_bytes = if body.len() >= 4 && body[0] == 0x28 && body[1] == 0xB5 {
-        zstd::decode_all(&body[..])
-            .map_err(|e| bad_request(format!("zstd decompression failed: {}", e)))?
+fn parse_qwen_sse_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return None;
+    }
+    if trimmed.starts_with("data: ") {
+        Some(trimmed[6..].trim().to_string())
     } else {
-        body.to_vec()
+        None
+    }
+}
+
+fn qwen_request_headers(token: &str) -> Vec<(String, String)> {
+    vec![
+        ("accept".to_string(), "text/event-stream".to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+        ("referer".to_string(), "https://chat.qwen.ai/".to_string()),
+        ("source".to_string(), "web".to_string()),
+        ("version".to_string(), "0.8.0".to_string()),
+        ("cookie".to_string(), format!("token={}", token)),
+    ]
+}
+
+type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+
+fn box_body<B>(body: B) -> BoxBody
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display,
+{
+    body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))
+        .boxed_unsync()
+}
+
+async fn handler(
+    req: Request<Incoming>,
+    st: Arc<AppState>,
+) -> Result<Response<BoxBody>, Infallible> {
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| box_body(b)));
+        }
     };
 
-    let v: serde_json::Value = serde_json::from_slice(&json_bytes)
-        .map_err(|e| bad_request(format!("Invalid JSON: {}", e)))?;
+    let json_bytes = body_bytes.to_vec();
+
+    let v: serde_json::Value = match serde_json::from_slice(&json_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| box_body(b)));
+        }
+    };
 
     let messages = if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
         msgs
     } else if let Some(input) = v.get("input").and_then(|m| m.as_array()) {
         input
     } else {
-        return Err(bad_request("messages or input array is required"));
+        return Ok(bad_request("messages or input array is required").map(|b| box_body(b)));
     };
 
     if messages.is_empty() {
-        return Err(bad_request("messages array cannot be empty"));
+        return Ok(bad_request("messages array cannot be empty").map(|b| box_body(b)));
     }
 
     let is_responses_api = v.get("input").is_some() && v.get("messages").is_none();
     let is_stream = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
+    let response_format = v.get("response_format").cloned();
     let msg = build_message(&v);
     let tools = parse_tools(&v);
 
     debug!(messages = messages.len(), stream = is_stream, "Processing request");
 
     let client_key = client_session_key(&v);
-    let session = st.sessions.acquire(&client_key, &st.token).await.map_err(|e| {
-        error!(error = %e, client_key = %client_key, "Failed to acquire session");
-        let status = if e.to_string().contains("expired") {
-            StatusCode::UNAUTHORIZED
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        openai_error(status, e.to_string(), "server_error", None, None)
-    })?;
-
-    let session_id = session.chat_id.clone();
-    let parent_id = session.parent_id.clone();
-    let parent_store = session.parent_store.clone();
+    let (session, session_id, parent_id, parent_store) = match st.sessions.acquire(&client_key, &st.token).await {
+        Ok(s) => {
+            let sid = s.chat_id.clone();
+            let pid = s.parent_id.clone();
+            let ps = s.parent_store.clone();
+            (s, sid, pid, ps)
+        }
+        Err(e) => {
+            error!(error = %e, client_key = %client_key, "Failed to acquire session");
+            let status = if e.to_string().contains("expired") {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return Ok(openai_error_response(status, e.to_string(), "server_error", None, None).map(|b| box_body(b)));
+        }
+    };
 
     let prompt = if tools.is_empty() {
         msg
@@ -410,390 +429,656 @@ async fn handler(
 
     let payload = qwen_payload(&session_id, parent_id.as_deref(), &prompt);
 
-    let resp = st
-        .http
-        .post(format!(
-            "{}/chat/completions?chat_id={}",
-            QWEN_API_BASE, session_id
-        ))
-        .header("accept", "text/event-stream")
-        .header("content-type", "application/json")
-        .header("referer", "https://chat.qwen.ai/")
-        .header("source", "web")
-        .header("version", "0.8.0")
-        .header("cookie", format!("token={}", st.token))
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to call Qwen API");
-            openai_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Qwen API error: {}", e),
-                "server_error",
-                None,
-                None,
-            )
-        })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        error!(
-            status = %status,
-            body_preview = %&body_text[..body_text.len().min(500)],
-            "Qwen chat/completions returned error"
-        );
-        if status.as_u16() == 429 || body_text.contains("in progress") {
-            return Err(openai_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Qwen chat is busy (another message in flight on this chat_id)",
-                "rate_limit_exceeded",
-                None,
-                Some("chat_in_progress"),
-            ));
-        }
-        return Err(openai_error(
-            StatusCode::BAD_GATEWAY,
-            format!("Qwen API returned {}", status),
-            "server_error",
-            None,
-            None,
-        ));
-    }
+    let qwen_url = format!("{}/chat/completions?chat_id={}", QWEN_API_BASE, session_id);
+    let headers = qwen_request_headers(&st.token);
 
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     let prompt_tokens = estimate_tokens(&prompt);
     let model = request_model(&v);
 
+    let body_bytes: Vec<u8> = serde_json::to_vec(&payload).unwrap_or_default();
+
     if is_stream {
-        let stream = resp.bytes_stream();
-        let completion_id_clone = completion_id.clone();
-        let model_clone = model.clone();
-        let tools_present = !tools.is_empty();
+        let rf = response_format.clone();
+        let span = info_span!("stream", id = %completion_id, model = %model, tools = tools.len(), response_format = %rf.as_ref().map(|rf| format!("{:?}", rf.get("type"))).unwrap_or_else(|| "none".to_string()));
+        async move {
+        let (tx, rx) = smol::channel::bounded::<Result<String, String>>(256);
 
-        let sse_stream = async_stream::stream! {
-            let _session_guard = session;
-            let mut buf = String::new();
-            let mut full_text = String::new();
-            let mut stream = std::pin::pin!(stream);
+        let tx2 = tx.clone();
+        let headers2 = headers.clone();
+        let qwen_url2 = qwen_url.clone();
+        let body2 = body_bytes.clone();
+        let rf_inner = rf.clone();
+        smol::spawn(async move {
+            let result = smol::unblock(move || -> Result<(), String> {
+                let mut resp = ureq::post(&qwen_url2);
+                for (k, v) in &headers2 {
+                    resp = resp.set(k, v);
+                }
+                let response = resp
+                    .send_bytes(&body2)
+                    .map_err(|e| format!("Qwen API error: {}", e))?;
 
-            while let Some(chunk_result) = stream.next().await {
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        yield Ok::<_, std::convert::Infallible>(Event::default().data(build_stream_chunk(
-                            &completion_id_clone, &model_clone, created,
-                            serde_json::json!({"content": format!("[Stream error: {}]", e)}),
-                            Some("stop")
-                        )));
-                        yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
-                        return;
+                if !(200..300).contains(&response.status()) {
+                    let status = response.status();
+                    let body_text = response.into_string().unwrap_or_default();
+                    let preview: String = body_text.chars().take(500).collect();
+                    error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
+                    if status == 429 || body_text.contains("in progress") {
+                        return Err("Qwen chat is busy (another message in flight on this chat_id)".to_string());
                     }
-                };
+                    return Err(format!("Qwen API returned {}", status));
+                }
 
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-
-                while let Some(nl) = buf.find('\n') {
-                    let line = buf[..nl].trim().to_string();
-                    buf = buf[nl + 1..].to_string();
-                    if !line.starts_with("data: ") { continue; }
-                    let d = line[6..].trim().to_string();
-                    if d.is_empty() || d == "[DONE]" { continue; }
-                    if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&d) {
-                        if let Some(pid) = extract_response_parent_id(&ch) {
-                            *parent_store.lock().await = Some(pid);
+                use std::io::{BufRead, BufReader};
+                let reader = response.into_reader();
+                for line in BufReader::new(reader).lines() {
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = tx2.try_send(Err(format!("Stream read error: {}", e)));
+                            break;
                         }
-                        append_sse_delta(&mut full_text, &ch);
+                    };
+                    if tx2.try_send(Ok(line)).is_err() {
+                        break;
                     }
                 }
+                Ok(())
+            }).await;
+            if let Err(e) = result {
+                let _ = tx.try_send(Err(e));
             }
+            drop(tx);
+        }).detach();
 
-            if full_text.is_empty() {
-                if let Some(err) = parse_qwen_upstream_error(&buf) {
-                    yield Ok::<_, std::convert::Infallible>(Event::default().data(build_stream_chunk(
-                        &completion_id_clone, &model_clone, created,
-                        serde_json::json!({"content": err}),
-                        Some("stop")
-                    )));
-                    yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
-                    return;
+        let has_tools = !tools.is_empty();
+        let sse_stream = futures::stream::unfold(
+            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize),
+            move |(rx, mut buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len)| {
+                let parent_store = parent_store.clone();
+                let tools = tools.clone();
+                let rf = rf_inner.clone();
+                let completion_id = completion_id.clone();
+                let model = model.clone();
+                async move {
+                    if done {
+                        return None;
+                    }
+                    match rx.recv().await {
+                        Ok(Ok(line)) => {
+                            if let Some(data) = parse_qwen_sse_line(&line) {
+                                if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
+                                    if let Some(pid) = extract_response_parent_id(&ch) {
+                                        *parent_store.lock().await = Some(pid);
+                                    }
+                                    if let Some(delta) = extract_qwen_sse_delta(&ch) {
+                                        full_text.append(&delta);
+                                    }
+                                }
+                            }
+                            let mut oai_chunks: Vec<String> = Vec::new();
+                            let thinking = full_text.thinking();
+                            if thinking.len() > prev_thinking_len {
+                                let delta = &thinking[prev_thinking_len..];
+                                oai_chunks.push(build_stream_chunk(
+                                    &completion_id, &model, created,
+                                    serde_json::json!({"thinking": delta}),
+                                    None,
+                                ));
+                                prev_thinking_len = thinking.len();
+                            }
+                            if !tool_emitted && !content_emitted {
+                                let tcs = detect_tools(full_text.full_answer(), &tools);
+                                if !tcs.is_empty() {
+                                    for (i, tc) in tcs.iter().enumerate() {
+                                        info!(tool = %tc.name, index = i, "Detected tool call");
+                                        let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                        for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
+                                            oai_chunks.push(s);
+                                        }
+                                    }
+                                    let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len)));
+                                }
+                                let answer = full_text.full_answer().to_string();
+                                let visible = client_visible_content(&answer, None, has_tools);
+                                if !visible.is_empty() {
+                                    content_emitted = true;
+                                }
+                            }
+                            if !tool_emitted && (!has_tools || content_emitted) {
+                                let answer = full_text.full_answer().to_string();
+                                let visible = client_visible_content(&answer, None, has_tools);
+                                let visible = if rf.is_some() {
+                                    strip_json_codeblock(&visible)
+                                } else {
+                                    visible
+                                };
+                                if visible.len() > prev_len {
+                                    let delta = &visible[prev_len..];
+                                    if prev_len == 0 {
+                                        oai_chunks.push(build_stream_chunk(
+                                            &completion_id, &model, created,
+                                            serde_json::json!({"role": "assistant", "content": delta.to_string()}),
+                                            None,
+                                        ));
+                                    } else {
+                                        oai_chunks.push(build_stream_chunk(
+                                            &completion_id, &model, created,
+                                            serde_json::json!({"content": delta.to_string()}),
+                                            None,
+                                        ));
+                                    }
+                                    prev_len = visible.len();
+                                } else if visible.len() < prev_len {
+                                    prev_len = visible.len();
+                                }
+                            }
+                            if !oai_chunks.is_empty() {
+                                let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len)));
+                            }
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len)))
+                        }
+                        Ok(Err(err_str)) => {
+                            let err_chunk = format!(
+                                "data: {}\n\ndata: [DONE]\n\n",
+                                build_stream_chunk(&completion_id, &model, created,
+                                    serde_json::json!({"content": format!("[Error: {}]", err_str)}),
+                                    Some("stop"),
+                                )
+                            );
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)))
+                        }
+                        Err(_) => {
+                            let mut final_chunks = String::new();
+                            if !tool_emitted && !content_emitted {
+                                let answer = full_text.full_answer().to_string();
+                                if has_tools {
+                                    if let Some(err_msg) = detect_qwen_tool_error(&answer) {
+                                        error!(error = %err_msg, "Qwen returned tool error in stream");
+                                        final_chunks.push_str(&format!(
+                                            "data: {}\n\n",
+                                            build_stream_chunk(&completion_id, &model, created,
+                                                serde_json::json!({"content": format!("[Tool Error: {}]", err_msg)}),
+                                                Some("stop"),
+                                            )
+                                        ));
+                                        final_chunks.push_str("data: [DONE]\n\n");
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)));
+                                    }
+                                }
+                                let tcs = detect_tools(&answer, &tools);
+                                if !tcs.is_empty() {
+                                    for (i, tc) in tcs.iter().enumerate() {
+                                        info!(tool = %tc.name, index = i, "Detected tool call at stream end");
+                                        let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                        for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
+                                            final_chunks.push_str(&format!("data: {}\n\n", s));
+                                        }
+                                    }
+                                } else {
+                                    let visible = client_visible_content(&answer, None, has_tools);
+                                    let visible = match process_structured_output(&visible, rf.as_ref()) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            error!(error = %e, "Structured output validation failed at stream end");
+                                            format!("[Structured Output Error: {}]", e)
+                                        }
+                                    };
+                                    if !visible.is_empty() {
+                                        final_chunks.push_str(&format!(
+                                            "data: {}\n\n",
+                                            build_stream_chunk(&completion_id, &model, created,
+                                                serde_json::json!({"role": "assistant", "content": visible}),
+                                                Some("stop"),
+                                            )
+                                        ));
+                                    }
+                                }
+                            }
+                            final_chunks.push_str("data: [DONE]\n\n");
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)))
+                        }
+                    }
                 }
-            }
+            },
+        );
 
-            let tc = detect_tool(&full_text, &tools);
-            if let Some(tc) = tc {
-                info!(tool = %tc.name, "Detected tool call (streaming)");
-                let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-                let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-                for chunk in build_tool_call_stream_chunks(
-                    &completion_id_clone, &model_clone, created, &tool_call_id, &tc.name, &args,
-                ) {
-                    yield Ok::<_, std::convert::Infallible>(Event::default().data(chunk));
-                }
-            } else {
-                yield Ok::<_, std::convert::Infallible>(Event::default().data(build_stream_chunk(
-                    &completion_id_clone, &model_clone, created,
-                    serde_json::json!({"role": "assistant", "content": ""}),
-                    None
-                )));
-                let visible = client_visible_content(&full_text, None, tools_present);
-                let content_bytes = visible.as_bytes();
-                let chunk_size = 16;
-                for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
-                    let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
-                    let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
-                    yield Ok::<_, std::convert::Infallible>(Event::default().data(build_stream_chunk(
-                        &completion_id_clone, &model_clone, created,
-                        serde_json::json!({"content": piece.to_string()}),
-                        None
-                    )));
-                }
-                yield Ok::<_, std::convert::Infallible>(Event::default().data(build_stream_chunk(
-                    &completion_id_clone, &model_clone, created,
-                    serde_json::json!({}),
-                    Some("stop")
-                )));
-            }
+        let body = StreamBody::new(sse_stream);
 
-            yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
-        };
+        let response = Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "*")
+            .header("access-control-allow-headers", "*")
+            .body(box_body(body))
+            .unwrap();
 
-        Ok(Sse::new(sse_stream)
-            .keep_alive(
-                KeepAlive::new()
-                    .interval(Duration::from_secs(15))
-                    .text("keep-alive-text"),
-            )
-            .into_response())
+        Ok(response)
+    }.instrument(span).await
     } else {
-        let mut buf = String::new();
-        let mut full_text = String::new();
-        let mut stream = resp.bytes_stream();
-
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                error!(error = %e, "Stream error");
-                openai_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Stream error: {}", e),
-                    "server_error",
-                    None,
-                    None,
-                )
-            })?;
-
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
-                buf = buf[nl + 1..].to_string();
-                if !line.starts_with("data: ") {
-                    continue;
-                }
-                let d = line[6..].trim().to_string();
-                if d.is_empty() || d == "[DONE]" {
-                    continue;
-                }
-                if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&d) {
-                    if let Some(pid) = extract_response_parent_id(&ch) {
-                        session.set_parent_id(pid).await;
-                    }
-                    append_sse_delta(&mut full_text, &ch);
-                }
+        match smol::unblock(move || -> Result<String> {
+            let mut resp = ureq::post(&qwen_url);
+            for (k, v) in &headers {
+                resp = resp.set(k, v);
             }
-        }
+            let response = resp
+                .send_bytes(&body_bytes)
+                .map_err(|e| anyhow::anyhow!("Qwen API error: {}", e))?;
 
-        let completion_tokens = estimate_tokens(&full_text);
-        let total_tokens = prompt_tokens + completion_tokens;
-
-        if full_text.is_empty() {
-            if let Some(err) = parse_qwen_upstream_error(&buf) {
-                return Err(openai_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    err,
-                    "rate_limit_exceeded",
-                    None,
-                    Some("rate_limit"),
-                ));
+            if !(200..300).contains(&response.status()) {
+                let status = response.status();
+                let body_text = response.into_string().unwrap_or_default();
+                let preview: String = body_text.chars().take(500).collect();
+                error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
+                if status == 429 || body_text.contains("in progress") {
+                    bail!("Qwen chat is busy (another message in flight on this chat_id)");
+                }
+                bail!("Qwen API returned {}", status);
             }
-        }
 
-        let tc = detect_tool(&full_text, &tools);
-
-        if let Some(tc) = tc {
-            info!(tool = %tc.name, "Detected tool call");
-            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-
-            if is_responses_api {
-                Ok(Json(serde_json::json!({
-                    "id": completion_id,
-                    "object": "response",
-                    "created_at": created,
-                    "model": model,
-                    "output": [{
-                        "type": "function_call",
-                        "id": tool_call_id,
-                        "call_id": tool_call_id,
-                        "name": tc.name,
-                        "arguments": args
-                    }],
-                    "usage": {
-                        "input_tokens": prompt_tokens,
-                        "output_tokens": completion_tokens,
-                        "total_tokens": total_tokens
+            let body_text = response.into_string().map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
+            Ok(body_text)
+        }).await {
+            Ok(body_text) => {
+                let mut acc = AccumulatedText::new();
+                for line in body_text.lines() {
+                    if let Some(data) = parse_qwen_sse_line(line) {
+                        if data == "[DONE]" { continue; }
+                        if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
+                            if let Some(pid) = extract_response_parent_id(&ch) {
+                                session.set_parent_id(pid).await;
+                            }
+                            append_sse_delta(&mut acc, &ch);
+                        }
                     }
-                }))
-                .into_response())
-            } else {
-                Ok(Json(serde_json::json!({
-                    "id": completion_id,
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": null,
-                            "tool_calls": [{
+                }
+
+                let full_text = acc.full_answer().to_string();
+                let completion_tokens = estimate_tokens(&full_text);
+                let total_tokens = prompt_tokens + completion_tokens;
+
+                if full_text.is_empty() {
+                    if let Some(err) = parse_qwen_upstream_error(&body_text) {
+                        return Ok(openai_error_response(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            err,
+                            "rate_limit_exceeded",
+                            None,
+                            Some("rate_limit"),
+                        ).map(|b| box_body(b)));
+                    }
+                }
+
+                if full_text.is_empty() && !tools.is_empty() {
+                    let tcs = detect_tools(&body_text, &tools);
+                    if !tcs.is_empty() {
+                        let tool_calls: Vec<serde_json::Value> = tcs.iter().enumerate().map(|(i, tc)| {
+                            info!(tool = %tc.name, index = i, "Detected tool call in raw body");
+                            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
+                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+                            serde_json::json!({
+                                "index": i,
                                 "id": tool_call_id,
                                 "type": "function",
                                 "function": {
                                     "name": tc.name,
                                     "arguments": args
                                 }
-                            }]
-                        },
-                        "finish_reason": "tool_calls"
-                    }],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens
+                            })
+                        }).collect();
+                        let resp_value = serde_json::json!({
+                            "id": completion_id,
+                            "object": "chat.completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": tool_calls
+                                },
+                                "finish_reason": "tool_calls"
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": 0,
+                                "total_tokens": prompt_tokens
+                            }
+                        });
+                        info!(count = tcs.len(), "Returning tool calls from raw body");
+                        return Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)));
                     }
-                }))
-                .into_response())
-            }
-        } else {
-            let visible = client_visible_content(&full_text, None, !tools.is_empty());
-            info!(len = visible.len(), "Returning text response");
+                }
 
-            if is_responses_api {
-                Ok(Json(serde_json::json!({
-                    "id": completion_id,
-                    "object": "response",
-                    "created_at": created,
-                    "model": model,
-                    "output": [{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": visible}]
-                    }],
-                    "usage": {
-                        "input_tokens": prompt_tokens,
-                        "output_tokens": completion_tokens,
-                        "total_tokens": total_tokens
+                if !full_text.is_empty() && !tools.is_empty() {
+                    if let Some(err_msg) = detect_qwen_tool_error(&full_text) {
+                        error!(error = %err_msg, "Qwen returned tool error in response text");
+                        let mut err = serde_json::json!({
+                            "message": err_msg,
+                            "type": "invalid_request_error",
+                        });
+                        err["available_tools"] = serde_json::json!(tools);
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            &serde_json::json!({"error": err}),
+                        ).map(|b| box_body(b)));
                     }
-                }))
-                .into_response())
-            } else {
-                Ok(Json(serde_json::json!({
-                    "id": completion_id,
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": visible
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens
+                }
+
+                let tcs = detect_tools(&full_text, &tools);
+
+                let resp_value = if !tcs.is_empty() {
+                    let tool_calls: Vec<serde_json::Value> = tcs.iter().enumerate().map(|(i, tc)| {
+                        info!(tool = %tc.name, index = i, "Detected tool call");
+                        let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
+                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+                        serde_json::json!({
+                            "index": i,
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": args
+                            }
+                        })
+                    }).collect();
+
+                    if is_responses_api {
+                        let output: Vec<serde_json::Value> = tcs.iter().map(|tc| {
+                            serde_json::json!({
+                                "type": "function_call",
+                                "id": format!("call_{}", uuid::Uuid::new_v4()),
+                                "call_id": format!("call_{}", uuid::Uuid::new_v4()),
+                                "name": tc.name,
+                                "arguments": serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string())
+                            })
+                        }).collect();
+                        serde_json::json!({
+                            "id": completion_id,
+                            "object": "response",
+                            "created_at": created,
+                            "model": model,
+                            "output": output,
+                            "usage": {
+                                "input_tokens": prompt_tokens,
+                                "output_tokens": completion_tokens,
+                                "total_tokens": total_tokens
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "id": completion_id,
+                            "object": "chat.completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": tool_calls
+                                },
+                                "finish_reason": "tool_calls"
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": total_tokens
+                            }
+                        })
                     }
-                }))
-                .into_response())
+                } else {
+                    let visible = client_visible_content(&full_text, None, !tools.is_empty());
+                    let visible = match process_structured_output(&visible, response_format.as_ref()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!(error = %e, "Structured output processing failed");
+                            return Ok(openai_error_response(
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                e,
+                                "invalid_response_error",
+                                None,
+                                None,
+                            ).map(|b| box_body(b)));
+                        }
+                    };
+                    info!(len = visible.len(), "Returning text response");
+
+                    if is_responses_api {
+                        serde_json::json!({
+                            "id": completion_id,
+                            "object": "response",
+                            "created_at": created,
+                            "model": model,
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": visible}]
+                            }],
+                            "usage": {
+                                "input_tokens": prompt_tokens,
+                                "output_tokens": completion_tokens,
+                                "total_tokens": total_tokens
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "id": completion_id,
+                            "object": "chat.completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": visible
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": total_tokens
+                            }
+                        })
+                    }
+                };
+
+                Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)))
+            }
+            Err(e) => {
+                error!(error = %e, "Qwen API call failed");
+                Ok(internal_error(format!("Qwen API error: {}", e)).map(|b| box_body(b)))
             }
         }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn embeddings_handler(
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody>, Infallible> {
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| box_body(b)));
+        }
+    };
+
+    let v: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| box_body(b)));
+        }
+    };
+
+    let input = v.get("input").and_then(|i| i.as_str()).unwrap_or("");
+    let dims = v.get("dimensions").and_then(|d| d.as_u64()).unwrap_or(1536) as usize;
+    let embedding: Vec<f64> = vec![0.0; dims];
+    let tokens = std::cmp::max(1, input.len() / 4);
+    let model = request_model(&v);
+
+    Ok(json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "embedding": embedding,
+                "index": 0
+            }],
+            "model": model,
+            "usage": {
+                "prompt_tokens": tokens,
+                "total_tokens": tokens
+            }
+        }),
+    ).map(|b| box_body(b)))
+}
+
+async fn router(
+    req: Request<Incoming>,
+    st: Arc<AppState>,
+) -> Result<Response<BoxBody>, Infallible> {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+
+    let cors = |resp: Response<BoxBody>| {
+        let (mut parts, body) = resp.into_parts();
+        parts.headers.insert("access-control-allow-origin", http::HeaderValue::from_static("*"));
+        parts.headers.insert("access-control-allow-methods", http::HeaderValue::from_static("*"));
+        parts.headers.insert("access-control-allow-headers", http::HeaderValue::from_static("*"));
+        Response::from_parts(parts, body)
+    };
+
+    if method == Method::OPTIONS {
+        return Ok(cors(
+            Response::builder()
+                .status(204)
+                .body(box_body(http_body_util::Empty::<Bytes>::new()))
+                .unwrap(),
+        ));
+    }
+
+    let resp = match (method.clone(), path.as_str()) {
+        (Method::GET, "/health") => health_handler().map(|b| box_body(b)),
+        (Method::GET, "/v1/models") => models_handler().map(|b| box_body(b)),
+        (Method::GET, p) if p.starts_with("/v1/models/") => {
+            let model_id = p.trim_start_matches("/v1/models/");
+            model_handler(model_id).map(|b| box_body(b))
+        }
+        (Method::POST, "/v1/chat/completions") | (Method::POST, "/v1/responses") => {
+            handler(req, st).await.unwrap()
+        }
+        (Method::POST, "/v1/embeddings") => {
+            embeddings_handler(req).await.unwrap()
+        }
+        (Method::GET, "/") | (Method::GET, "") => {
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"message": "Qwen OpenAI Proxy (smol+hyper)", "version": "0.1.0"}),
+            ).map(|b| box_body(b))
+        }
+        _ => {
+            if method == Method::POST {
+                handler(req, st).await.unwrap()
+            } else {
+                not_found_response().map(|b| box_body(b))
+            }
+        }
+    };
+
+    Ok(cors(resp))
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "qwen_proxy=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "qwen_proxy=info".into()),
         )
         .init();
 
-    let http = qwen_http_client()?;
     let token = load_token()?;
 
     let state = Arc::new(AppState {
-        sessions: SessionManager::new(http.clone()),
-        http,
+        sessions: SessionManager::new(),
         token,
     });
-
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/v1/models", get(models_handler))
-        .route("/v1/models/:model", get(model_handler))
-        .route("/v1/chat/completions", post(handler))
-        .route("/v1/responses", post(handler))
-        .route("/v1/embeddings", post(embeddings_handler))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .with_state(state);
 
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8765);
     let addr = format!("0.0.0.0:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("Qwen OpenAI proxy listening on http://{}", addr);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    info!("Qwen OpenAI proxy (smol+hyper) listening on http://{}", addr);
 
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    let term = Arc::new(AtomicBool::new(false));
+    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term)) {
+        error!(error = %e, "Failed to register SIGINT handler");
     }
-    info!("Shutting down");
+    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term)) {
+        error!(error = %e, "Failed to register SIGTERM handler");
+    }
+
+    smol::block_on(async {
+        let listener = smol::net::TcpListener::bind(&addr)
+            .await
+            .expect("Failed to bind address");
+
+        let shutdown_check = async {
+            loop {
+                smol::Timer::after(Duration::from_millis(200)).await;
+                if term.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        };
+
+        loop {
+            use futures::future::Either;
+            let accept_fut = Box::pin(listener.accept());
+            let check_fut = Box::pin(shutdown_check);
+            match futures::future::select(accept_fut, check_fut).await {
+                Either::Left((Ok((stream, peer)), _)) => {
+                    let state = state.clone();
+                    smol::spawn(async move {
+                        let stream = smol_hyper::rt::FuturesIo::new(stream);
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            router(req, state.clone())
+                        });
+
+                        if let Err(e) = http1::Builder::new()
+                            .keep_alive(true)
+                            .serve_connection(stream, service)
+                            .await
+                        {
+                            debug!("Connection error from {}: {}", peer, e);
+                        }
+                    })
+                    .detach();
+                }
+                Either::Left((Err(e), _)) => {
+                    error!("Accept error: {}", e);
+                    continue;
+                }
+                Either::Right(((), _)) => {
+                    info!("Shutdown signal received, draining connections...");
+                    break;
+                }
+            }
+        }
+
+        info!("Shutdown complete");
+    })
 }
