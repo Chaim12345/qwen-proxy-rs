@@ -103,6 +103,42 @@ pub fn parse_qwen_upstream_error(raw: &str) -> Option<String> {
     Some(msg.to_string())
 }
 
+/// Strip markdown code block fences from JSON text if present.
+/// Handles ```json ... ``` and ``` ... ``` patterns.
+pub fn strip_json_codeblock(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(caps) = MARKDOWN_CODE_RE.captures(trimmed) {
+        if let Some(inner) = caps.get(1) {
+            return inner.as_str().trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Process response content for structured output (response_format).
+/// Strips code blocks and validates JSON for json_object/json_schema.
+pub fn process_structured_output(
+    text: &str,
+    rf: Option<&Value>,
+) -> Result<String, String> {
+    let rf = match rf {
+        Some(r) => r,
+        None => return Ok(text.to_string()),
+    };
+    let rf_type = rf.get("type").and_then(|t| t.as_str());
+    if rf_type != Some("json_schema") && rf_type != Some("json_object") {
+        return Ok(text.to_string());
+    }
+    let cleaned = strip_json_codeblock(text);
+    if serde_json::from_str::<Value>(&cleaned).is_err() {
+        return Err(format!(
+            "Response is not valid JSON despite response_format. Got: {}",
+            cleaned.chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(cleaned)
+}
+
 /// Detect tool-related error messages in Qwen response text.
 /// When the Qwen model can't use a tool, it returns text like
 /// "Tool calculator does not exists" or "无法使用该工具".

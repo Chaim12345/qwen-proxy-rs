@@ -388,6 +388,7 @@ async fn handler(
 
     let is_responses_api = v.get("input").is_some() && v.get("messages").is_none();
     let is_stream = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
+    let response_format = v.get("response_format").cloned();
     let msg = build_message(&v);
     let tools = parse_tools(&v);
 
@@ -820,6 +821,19 @@ async fn handler(
                     }
                 } else {
                     let visible = client_visible_content(&full_text, None, !tools.is_empty());
+                    let visible = match process_structured_output(&visible, response_format.as_ref()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!(error = %e, "Structured output processing failed");
+                            return Ok(openai_error_response(
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                e,
+                                "invalid_response_error",
+                                None,
+                                None,
+                            ).map(|b| box_body(b)));
+                        }
+                    };
                     info!(len = visible.len(), "Returning text response");
 
                     if is_responses_api {
