@@ -325,6 +325,7 @@ fn extract_json_blocks(text: &str) -> Vec<String> {
 }
 
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub name: String,
     pub args: serde_json::Value,
@@ -439,6 +440,7 @@ pub fn build_message(v: &Value) -> String {
             if msg["role"] == "tool" {
                 let tool_result = message_content_to_string(&msg["content"]);
                 parts.push(format!("TOOL RESULT: {}", tool_result));
+                continue;
             }
         }
     }
@@ -587,7 +589,8 @@ fn accept_tool_call(tc: ToolCall, tool_names: &[&str]) -> Option<ToolCall> {
 /// 1. Markdown code blocks containing JSON
 /// 2. Proper JSON parsing with string/escape handling
 /// 3. Line-by-line scanning for tool-like patterns
-pub fn detect_tool(text: &str, tool_defs: &[Value]) -> Option<ToolCall> {
+/// Returns all unique tool calls found.
+pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     let normalized = normalize_tool_call_text(text);
     let tool_names: Vec<&str> = tool_defs
         .iter()
@@ -601,11 +604,19 @@ pub fn detect_tool(text: &str, tool_defs: &[Value]) -> Option<ToolCall> {
         "Starting tool detection"
     );
 
+    let mut found: Vec<ToolCall> = Vec::new();
+
+    let mut add_unique = |tc: ToolCall| {
+        if !found.contains(&tc) {
+            found.push(tc);
+        }
+    };
+
     for cap in MARKDOWN_CODE_RE.captures_iter(&normalized) {
         let json_str = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
         if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
             debug!(strategy = "markdown_code_block", tool = %tc.name, "Tool detected");
-            return Some(tc);
+            add_unique(tc);
         }
     }
 
@@ -613,13 +624,13 @@ pub fn detect_tool(text: &str, tool_defs: &[Value]) -> Option<ToolCall> {
     for json_str in blocks.iter().filter(|b| b.contains("\"tool\"")) {
         if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
             debug!(strategy = "json_object_scan", tool = %tc.name, "Tool detected");
-            return Some(tc);
+            add_unique(tc);
         }
     }
     for json_str in &blocks {
         if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
             debug!(strategy = "json_object_scan_fallback", tool = %tc.name, "Tool detected");
-            return Some(tc);
+            add_unique(tc);
         }
     }
 
@@ -631,15 +642,19 @@ pub fn detect_tool(text: &str, tool_defs: &[Value]) -> Option<ToolCall> {
                     let json_str = &trimmed[start..=end];
                     if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
                         debug!(strategy = "line_scan", tool = %tc.name, "Tool detected");
-                        return Some(tc);
+                        add_unique(tc);
                     }
                 }
             }
         }
     }
 
-    debug!("No tool call detected in text");
-    None
+    if found.is_empty() {
+        debug!("No tool call detected in text");
+    } else {
+        debug!(count = found.len(), "Tool calls detected");
+    }
+    found
 }
 
 
@@ -661,32 +676,36 @@ mod tests {
     fn test_detect_tool_simple() {
         let text = r#"{"tool":"write","args":{"path":"test.txt","content":"hello"}}"#;
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool");
-        assert_eq!(tc.name, "write");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write");
     }
 
     #[test]
     fn test_detect_tool_in_markdown() {
         let text = "Here is the tool call:\n```json\n{\"tool\":\"bash\",\"args\":{\"command\":\"ls\"}}\n```\nDone.";
         let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool in markdown");
-        assert_eq!(tc.name, "bash");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "bash");
     }
 
     #[test]
     fn test_detect_tool_embedded_in_text() {
         let text = "I've created the file. {\"tool\":\"write\",\"args\":{\"path\":\"demo.py\",\"content\":\"print('hi')\"}} The file is ready.";
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect embedded tool");
-        assert_eq!(tc.name, "write");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write");
     }
 
     #[test]
     fn test_detect_tool_unknown_tool() {
         let text = r#"{"tool":"unknown","args":{}}"#;
         let tools: Vec<Value> = vec![];
-        let tc = detect_tool(text, &tools).expect("should detect unknown tool");
-        assert_eq!(tc.name, "unknown");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "unknown");
     }
 
     #[test]
@@ -694,10 +713,11 @@ mod tests {
         // This is the key test - args contain braces inside a string value
         let text = r#"{"tool":"bash","args":{"command":"echo {hello}"}}"#;
         let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
-        let tc =
-            detect_tool(text, &tools).expect("should detect tool with nested braces in string");
-        assert_eq!(tc.name, "bash");
-        assert_eq!(tc.args["command"], "echo {hello}");
+        let tcs =
+            detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "bash");
+        assert_eq!(tcs[0].args["command"], "echo {hello}");
     }
 
     #[test]
@@ -705,17 +725,32 @@ mod tests {
         let text =
             r#"{"tool":"write","args":{"path":"test.json","content":"{\"key\": \"value\"}"}}"#;
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool with deeply nested JSON");
-        assert_eq!(tc.name, "write");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write");
     }
 
     #[test]
     fn test_detect_tool_escaped_quotes() {
         let text = r#"{"tool":"write","args":{"content":"He said \"hello\""}}"#;
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool with escaped quotes");
-        assert_eq!(tc.name, "write");
-        assert_eq!(tc.args["content"], "He said \"hello\"");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write");
+        assert_eq!(tcs[0].args["content"], "He said \"hello\"");
+    }
+
+    #[test]
+    fn test_detect_multiple_tools() {
+        let text = "First I'll read the file:\n```json\n{\"tool\":\"read\",\"args\":{\"path\":\"test.txt\"}}\n```\nThen I'll write:\n```json\n{\"tool\":\"write\",\"args\":{\"path\":\"out.txt\",\"content\":\"done\"}}\n```\nFinished.";
+        let tools = vec![
+            serde_json::json!({"name":"read","description":"","parameters":{}}),
+            serde_json::json!({"name":"write","description":"","parameters":{}}),
+        ];
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 2, "should detect both tool calls");
+        assert_eq!(tcs[0].name, "read");
+        assert_eq!(tcs[1].name, "write");
     }
 
     #[test]
@@ -751,9 +786,10 @@ mod tests {
     fn test_detect_tool_spinner_in_args() {
         let text = r#"{"tool":"bash","args":{"⠧ Thinking...command":"echo TOOLCALL-LIVE"}}"#;
         let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
-        let tc = detect_tool(text, &tools).expect("should detect tool with spinner in args");
-        assert_eq!(tc.name, "bash");
-        assert_eq!(tc.args["command"], "echo TOOLCALL-LIVE");
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 1, "should detect tool with spinner in args");
+        assert_eq!(tcs[0].name, "bash");
+        assert_eq!(tcs[0].args["command"], "echo TOOLCALL-LIVE");
     }
 
     #[test]

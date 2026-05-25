@@ -10,8 +10,20 @@ use futures::lock::{Mutex, OwnedMutexGuard};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
-const MAX_SESSIONS: usize = 100;
+fn session_ttl() -> Duration {
+    let minutes = std::env::var("QWEN_PROXY_SESSION_TTL_MINUTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30u64);
+    Duration::from_secs(minutes * 60)
+}
+
+fn max_sessions() -> usize {
+    std::env::var("QWEN_PROXY_MAX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+}
 const MODEL_NAME: &str = "qwen3.7-max";
 const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
 
@@ -53,12 +65,12 @@ impl SessionManager {
     pub async fn acquire(&self, client_key: &str, token: &str) -> Result<AcquiredSession> {
         self.cleanup_expired();
 
-        if self.sessions.len() >= MAX_SESSIONS {
+        if self.sessions.len() >= max_sessions() {
             self.evict_oldest();
         }
 
         let entry = match self.sessions.get(client_key) {
-            Some(existing) if existing.created_at.elapsed() < SESSION_TTL => existing.clone(),
+            Some(existing) if existing.created_at.elapsed() < session_ttl() => existing.clone(),
             Some(_) => {
                 drop(self.sessions.remove(client_key));
                 self.insert_new_entry(client_key, token).await?
@@ -132,7 +144,7 @@ impl SessionManager {
     }
 
     fn cleanup_expired(&self) {
-        let cutoff = Instant::now() - SESSION_TTL;
+        let cutoff = Instant::now() - session_ttl();
         self.sessions.retain(|_, s| s.created_at > cutoff);
     }
 

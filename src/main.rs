@@ -16,8 +16,10 @@ use smol_hyper;
 use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use std::time::Duration;
+use tracing::{debug, error, info, info_span, Instrument};
 
 const MODEL_NAME: &str = "qwen3.7-max";
 const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
@@ -71,6 +73,7 @@ fn json_response<T: serde::Serialize>(status: StatusCode, body: &T) -> Response<
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        .header("content-length", json.len().to_string())
         .body(Full::new(Bytes::from(json)))
         .unwrap()
 }
@@ -205,6 +208,7 @@ fn build_tool_call_stream_chunks(
     id: &str,
     model: &str,
     created: i64,
+    index: usize,
     tool_call_id: &str,
     name: &str,
     args_json: &str,
@@ -218,7 +222,7 @@ fn build_tool_call_stream_chunks(
             "role": "assistant",
             "content": null,
             "tool_calls": [{
-                "index": 0,
+                "index": index,
                 "id": tool_call_id,
                 "type": "function",
                 "function": { "name": name, "arguments": "" }
@@ -238,7 +242,7 @@ fn build_tool_call_stream_chunks(
             created,
             serde_json::json!({
                 "tool_calls": [{
-                    "index": 0,
+                    "index": index,
                     "function": { "arguments": arg_piece.to_string() }
                 }]
             }),
@@ -436,12 +440,16 @@ async fn handler(
     let body_bytes: Vec<u8> = serde_json::to_vec(&payload).unwrap_or_default();
 
     if is_stream {
+        let rf = response_format.clone();
+        let span = info_span!("stream", id = %completion_id, model = %model, tools = tools.len(), response_format = %rf.as_ref().map(|rf| format!("{:?}", rf.get("type"))).unwrap_or_else(|| "none".to_string()));
+        async move {
         let (tx, rx) = smol::channel::bounded::<Result<String, String>>(256);
 
         let tx2 = tx.clone();
         let headers2 = headers.clone();
         let qwen_url2 = qwen_url.clone();
         let body2 = body_bytes.clone();
+        let rf_inner = rf.clone();
         smol::spawn(async move {
             let result = smol::unblock(move || -> Result<(), String> {
                 let mut resp = ureq::post(&qwen_url2);
@@ -463,23 +471,18 @@ async fn handler(
                     return Err(format!("Qwen API returned {}", status));
                 }
 
-                use std::io::Read;
-                let mut reader = response.into_reader();
-                let mut buf = vec![0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if tx2.try_send(Ok(
-                                String::from_utf8_lossy(&buf[..n]).to_string()
-                            )).is_err() {
-                                break;
-                            }
-                        }
+                use std::io::{BufRead, BufReader};
+                let reader = response.into_reader();
+                for line in BufReader::new(reader).lines() {
+                    let line = match line {
+                        Ok(l) => l,
                         Err(e) => {
                             let _ = tx2.try_send(Err(format!("Stream read error: {}", e)));
                             break;
                         }
+                    };
+                    if tx2.try_send(Ok(line)).is_err() {
+                        break;
                     }
                 }
                 Ok(())
@@ -496,6 +499,7 @@ async fn handler(
             move |(rx, mut buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
+                let rf = rf_inner.clone();
                 let completion_id = completion_id.clone();
                 let model = model.clone();
                 async move {
@@ -503,34 +507,14 @@ async fn handler(
                         return None;
                     }
                     match rx.recv().await {
-                        Ok(Ok(chunk)) => {
-                            buf.push_str(&chunk);
-                            loop {
-                                let nl = match buf.find('\n') {
-                                    Some(p) => p,
-                                    None => break,
-                                };
-                                let line = buf[..nl].to_string();
-                                buf = buf[nl + 1..].to_string();
-                                let data = match parse_qwen_sse_line(&line) {
-                                    Some(d) => d,
-                                    None => continue,
-                                };
-                                if data == "[DONE]" {
-                                    continue;
-                                }
+                        Ok(Ok(line)) => {
+                            if let Some(data) = parse_qwen_sse_line(&line) {
                                 if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
                                     if let Some(pid) = extract_response_parent_id(&ch) {
                                         *parent_store.lock().await = Some(pid);
                                     }
                                     if let Some(delta) = extract_qwen_sse_delta(&ch) {
                                         full_text.append(&delta);
-                                    }
-                                }
-                                if !content_emitted {
-                                    let tc = detect_tool(full_text.full_answer(), &tools);
-                                    if tc.is_some() {
-                                        break;
                                     }
                                 }
                             }
@@ -546,13 +530,15 @@ async fn handler(
                                 prev_thinking_len = thinking.len();
                             }
                             if !tool_emitted && !content_emitted {
-                                let tc = detect_tool(full_text.full_answer(), &tools);
-                                if let Some(tc) = tc {
-                                    info!(tool = %tc.name, "Detected tool call");
-                                    let tid = format!("call_{}", uuid::Uuid::new_v4());
-                                    let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
-                                    for s in build_tool_call_stream_chunks(&completion_id, &model, created, &tid, &tc.name, &args) {
-                                        oai_chunks.push(s);
+                                let tcs = detect_tools(full_text.full_answer(), &tools);
+                                if !tcs.is_empty() {
+                                    for (i, tc) in tcs.iter().enumerate() {
+                                        info!(tool = %tc.name, index = i, "Detected tool call");
+                                        let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                        for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
+                                            oai_chunks.push(s);
+                                        }
                                     }
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
                                     return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len)));
@@ -566,28 +552,28 @@ async fn handler(
                             if !tool_emitted && (!has_tools || content_emitted) {
                                 let answer = full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
+                                let visible = if rf.is_some() {
+                                    strip_json_codeblock(&visible)
+                                } else {
+                                    visible
+                                };
                                 if visible.len() > prev_len {
                                     let delta = &visible[prev_len..];
-                                    let chunk_size = 16;
-                                    let mut first = prev_len == 0;
-                                    for chunk_start in (0..delta.len()).step_by(chunk_size) {
-                                        let chunk_end = std::cmp::min(chunk_start + chunk_size, delta.len());
-                                        let piece = &delta[chunk_start..chunk_end];
-                                        if first {
-                                            oai_chunks.push(build_stream_chunk(
-                                                &completion_id, &model, created,
-                                                serde_json::json!({"role": "assistant", "content": piece.to_string()}),
-                                                None,
-                                            ));
-                                            first = false;
-                                        } else {
-                                            oai_chunks.push(build_stream_chunk(
-                                                &completion_id, &model, created,
-                                                serde_json::json!({"content": piece.to_string()}),
-                                                None,
-                                            ));
-                                        }
+                                    if prev_len == 0 {
+                                        oai_chunks.push(build_stream_chunk(
+                                            &completion_id, &model, created,
+                                            serde_json::json!({"role": "assistant", "content": delta.to_string()}),
+                                            None,
+                                        ));
+                                    } else {
+                                        oai_chunks.push(build_stream_chunk(
+                                            &completion_id, &model, created,
+                                            serde_json::json!({"content": delta.to_string()}),
+                                            None,
+                                        ));
                                     }
+                                    prev_len = visible.len();
+                                } else if visible.len() < prev_len {
                                     prev_len = visible.len();
                                 }
                             }
@@ -625,16 +611,25 @@ async fn handler(
                                         return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)));
                                     }
                                 }
-                                let tc = detect_tool(&answer, &tools);
-                                if let Some(tc) = tc {
-                                    info!(tool = %tc.name, "Detected tool call");
-                                    let tid = format!("call_{}", uuid::Uuid::new_v4());
-                                    let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
-                                    for s in build_tool_call_stream_chunks(&completion_id, &model, created, &tid, &tc.name, &args) {
-                                        final_chunks.push_str(&format!("data: {}\n\n", s));
+                                let tcs = detect_tools(&answer, &tools);
+                                if !tcs.is_empty() {
+                                    for (i, tc) in tcs.iter().enumerate() {
+                                        info!(tool = %tc.name, index = i, "Detected tool call at stream end");
+                                        let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                        for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
+                                            final_chunks.push_str(&format!("data: {}\n\n", s));
+                                        }
                                     }
                                 } else {
                                     let visible = client_visible_content(&answer, None, has_tools);
+                                    let visible = match process_structured_output(&visible, rf.as_ref()) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            error!(error = %e, "Structured output validation failed at stream end");
+                                            format!("[Structured Output Error: {}]", e)
+                                        }
+                                    };
                                     if !visible.is_empty() {
                                         final_chunks.push_str(&format!(
                                             "data: {}\n\n",
@@ -668,6 +663,7 @@ async fn handler(
             .unwrap();
 
         Ok(response)
+    }.instrument(span).await
     } else {
         match smol::unblock(move || -> Result<String> {
             let mut resp = ureq::post(&qwen_url);
@@ -723,10 +719,22 @@ async fn handler(
                 }
 
                 if full_text.is_empty() && !tools.is_empty() {
-                    if let Some(tc) = detect_tool(&body_text, &tools) {
-                        info!(tool = %tc.name, "Detected tool call in raw body");
-                        let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+                    let tcs = detect_tools(&body_text, &tools);
+                    if !tcs.is_empty() {
+                        let tool_calls: Vec<serde_json::Value> = tcs.iter().enumerate().map(|(i, tc)| {
+                            info!(tool = %tc.name, index = i, "Detected tool call in raw body");
+                            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
+                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+                            serde_json::json!({
+                                "index": i,
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": args
+                                }
+                            })
+                        }).collect();
                         let resp_value = serde_json::json!({
                             "id": completion_id,
                             "object": "chat.completion",
@@ -737,14 +745,7 @@ async fn handler(
                                 "message": {
                                     "role": "assistant",
                                     "content": null,
-                                    "tool_calls": [{
-                                        "id": tool_call_id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc.name,
-                                            "arguments": args
-                                        }
-                                    }]
+                                    "tool_calls": tool_calls
                                 },
                                 "finish_reason": "tool_calls"
                             }],
@@ -754,7 +755,7 @@ async fn handler(
                                 "total_tokens": prompt_tokens
                             }
                         });
-                        info!(len = 0, "Returning tool call from raw body");
+                        info!(count = tcs.len(), "Returning tool calls from raw body");
                         return Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)));
                     }
                 }
@@ -774,26 +775,40 @@ async fn handler(
                     }
                 }
 
-                let tc = detect_tool(&full_text, &tools);
+                let tcs = detect_tools(&full_text, &tools);
 
-                let resp_value = if let Some(tc) = tc {
-                    info!(tool = %tc.name, "Detected tool call");
-                    let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-                    let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+                let resp_value = if !tcs.is_empty() {
+                    let tool_calls: Vec<serde_json::Value> = tcs.iter().enumerate().map(|(i, tc)| {
+                        info!(tool = %tc.name, index = i, "Detected tool call");
+                        let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
+                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+                        serde_json::json!({
+                            "index": i,
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": args
+                            }
+                        })
+                    }).collect();
 
                     if is_responses_api {
+                        let output: Vec<serde_json::Value> = tcs.iter().map(|tc| {
+                            serde_json::json!({
+                                "type": "function_call",
+                                "id": format!("call_{}", uuid::Uuid::new_v4()),
+                                "call_id": format!("call_{}", uuid::Uuid::new_v4()),
+                                "name": tc.name,
+                                "arguments": serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string())
+                            })
+                        }).collect();
                         serde_json::json!({
                             "id": completion_id,
                             "object": "response",
                             "created_at": created,
                             "model": model,
-                            "output": [{
-                                "type": "function_call",
-                                "id": tool_call_id,
-                                "call_id": tool_call_id,
-                                "name": tc.name,
-                                "arguments": args
-                            }],
+                            "output": output,
                             "usage": {
                                 "input_tokens": prompt_tokens,
                                 "output_tokens": completion_tokens,
@@ -811,14 +826,7 @@ async fn handler(
                                 "message": {
                                     "role": "assistant",
                                     "content": null,
-                                    "tool_calls": [{
-                                        "id": tool_call_id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc.name,
-                                            "arguments": args
-                                        }
-                                    }]
+                                    "tool_calls": tool_calls
                                 },
                                 "finish_reason": "tool_calls"
                             }],
@@ -1015,37 +1023,62 @@ fn main() -> Result<()> {
 
     info!("Qwen OpenAI proxy (smol+hyper) listening on http://{}", addr);
 
+    let term = Arc::new(AtomicBool::new(false));
+    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term)) {
+        error!(error = %e, "Failed to register SIGINT handler");
+    }
+    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term)) {
+        error!(error = %e, "Failed to register SIGTERM handler");
+    }
+
     smol::block_on(async {
         let listener = smol::net::TcpListener::bind(&addr)
             .await
             .expect("Failed to bind address");
 
+        let shutdown_check = async {
+            loop {
+                smol::Timer::after(Duration::from_millis(200)).await;
+                if term.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        };
+
         loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
+            use futures::future::Either;
+            let accept_fut = Box::pin(listener.accept());
+            let check_fut = Box::pin(shutdown_check);
+            match futures::future::select(accept_fut, check_fut).await {
+                Either::Left((Ok((stream, peer)), _)) => {
+                    let state = state.clone();
+                    smol::spawn(async move {
+                        let stream = smol_hyper::rt::FuturesIo::new(stream);
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            router(req, state.clone())
+                        });
+
+                        if let Err(e) = http1::Builder::new()
+                            .keep_alive(true)
+                            .serve_connection(stream, service)
+                            .await
+                        {
+                            debug!("Connection error from {}: {}", peer, e);
+                        }
+                    })
+                    .detach();
+                }
+                Either::Left((Err(e), _)) => {
                     error!("Accept error: {}", e);
                     continue;
                 }
-            };
-
-            let state = state.clone();
-
-            smol::spawn(async move {
-                let stream = smol_hyper::rt::FuturesIo::new(stream);
-                let service = service_fn(move |req: Request<Incoming>| {
-                    router(req, state.clone())
-                });
-
-                if let Err(e) = http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(stream, service)
-                    .await
-                {
-                    debug!("Connection error from {}: {}", peer, e);
+                Either::Right(((), _)) => {
+                    info!("Shutdown signal received, draining connections...");
+                    break;
                 }
-            })
-            .detach();
+            }
         }
+
+        info!("Shutdown complete");
     })
 }
