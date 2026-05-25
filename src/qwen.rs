@@ -104,46 +104,148 @@ pub fn parse_qwen_upstream_error(raw: &str) -> Option<String> {
     Some(msg.to_string())
 }
 
-pub fn extract_qwen_sse_delta(ch: &Value) -> Option<String> {
-    let phase = ch
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|c| c.first())
-        .and_then(|c| c.get("delta"))
-        .and_then(|d| d.get("phase"))
-        .and_then(|p| p.as_str())
-        .or_else(|| ch.get("phase").and_then(|p| p.as_str()))
-        .unwrap_or("");
+#[derive(Debug, Clone, PartialEq)]
+pub enum QwenPhase {
+    ThinkingSummary,
+    Thinking,
+    Search,
+    Answer,
+    Other(String),
+}
 
-    if phase == "thinking_summary" || phase == "thinking" || phase == "search" {
-        return None;
+impl QwenPhase {
+    pub fn as_str(&self) -> &str {
+        match self {
+            QwenPhase::ThinkingSummary => "thinking_summary",
+            QwenPhase::Thinking => "thinking",
+            QwenPhase::Search => "search",
+            QwenPhase::Answer => "answer",
+            QwenPhase::Other(s) => s.as_str(),
+        }
+    }
+}
+
+pub struct QwenSseDelta {
+    pub phase: QwenPhase,
+    pub text: String,
+    pub finished: bool,
+}
+
+pub struct AccumulatedText {
+    pub thinking: String,
+    pub answer: String,
+}
+
+impl AccumulatedText {
+    pub fn new() -> Self {
+        AccumulatedText { thinking: String::new(), answer: String::new() }
     }
 
+    pub fn append(&mut self, delta: &QwenSseDelta) {
+        match delta.phase {
+            QwenPhase::ThinkingSummary | QwenPhase::Thinking => {
+                if !delta.text.is_empty() {
+                    if !self.thinking.is_empty() {
+                        self.thinking.push('\n');
+                    }
+                    self.thinking.push_str(&delta.text);
+                }
+            }
+            QwenPhase::Answer | QwenPhase::Other(_) => {
+                self.answer.push_str(&delta.text);
+            }
+            QwenPhase::Search => {}
+        }
+    }
+
+    pub fn full_answer(&self) -> &str {
+        &self.answer
+    }
+}
+
+pub fn extract_qwen_sse_delta(ch: &Value) -> Option<QwenSseDelta> {
     let delta = ch
         .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|c| c.first())
         .and_then(|c| c.get("delta"));
 
-    let mut text = extract_string_value(
-        delta
-            .and_then(|d| d.get("content"))
-            .unwrap_or(&Value::Null),
-    );
-    if text.is_empty() {
-        text = ch
-            .get("response")
-            .map(|r| extract_string_value(r.get("content").unwrap_or(&Value::Null)))
-            .unwrap_or_default();
-    }
-    if text.is_empty() {
-        text = extract_string_value(ch.get("content").unwrap_or(&Value::Null));
+    let phase_str = delta
+        .as_ref()
+        .and_then(|d| d.get("phase"))
+        .and_then(|p| p.as_str())
+        .or_else(|| ch.get("phase").and_then(|p| p.as_str()))
+        .unwrap_or("");
+
+    let phase = match phase_str {
+        "thinking_summary" => QwenPhase::ThinkingSummary,
+        "thinking" => QwenPhase::Thinking,
+        "search" => QwenPhase::Search,
+        "answer" => QwenPhase::Answer,
+        other => if other.is_empty() { QwenPhase::Answer } else { QwenPhase::Other(other.to_string()) },
+    };
+
+    let finished = delta
+        .as_ref()
+        .and_then(|d| d.get("status"))
+        .and_then(|s| s.as_str())
+        .map(|s| s == "finished")
+        .unwrap_or(false);
+
+    let mut text = String::new();
+
+    if phase == QwenPhase::ThinkingSummary {
+        if let Some(extra) = delta.as_ref().and_then(|d| d.get("extra")) {
+            if let Some(title) = extra.get("summary_title").and_then(|s| s.get("content")) {
+                if let Some(arr) = title.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            text.push_str(s);
+                        }
+                    }
+                } else if let Some(s) = title.as_str() {
+                    text.push_str(s);
+                }
+            }
+            if let Some(thought) = extra.get("summary_thought").and_then(|s| s.get("content")) {
+                if let Some(arr) = thought.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(s);
+                        }
+                    }
+                } else if let Some(s) = thought.as_str() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(s);
+                }
+            }
+        }
+    } else {
+        text = extract_string_value(
+            delta
+                .and_then(|d| d.get("content"))
+                .unwrap_or(&Value::Null),
+        );
+        if text.is_empty() {
+            text = ch
+                .get("response")
+                .map(|r| extract_string_value(r.get("content").unwrap_or(&Value::Null)))
+                .unwrap_or_default();
+        }
+        if text.is_empty() {
+            text = extract_string_value(ch.get("content").unwrap_or(&Value::Null));
+        }
     }
 
-    if text.is_empty() {
+    if text.is_empty() && !finished {
         None
     } else {
-        Some(text)
+        Some(QwenSseDelta { phase, text, finished })
     }
 }
 

@@ -256,10 +256,42 @@ fn build_tool_call_stream_chunks(
     chunks
 }
 
-fn append_sse_delta(full_text: &mut String, ch: &serde_json::Value) {
+fn append_sse_delta(acc: &mut AccumulatedText, ch: &serde_json::Value) {
     if let Some(delta) = extract_qwen_sse_delta(ch) {
-        full_text.push_str(&delta);
+        acc.append(&delta);
     }
+}
+
+fn sse_line_to_openai(
+    line: &str,
+    completion_id: &str,
+    model: &str,
+    created: i64,
+    has_tools: bool,
+    full_text: &mut AccumulatedText,
+) -> Option<String> {
+    let data = parse_qwen_sse_line(line)?;
+    if data == "[DONE]" {
+        return None;
+    }
+    let ch: serde_json::Value = serde_json::from_str(&data).ok()?;
+    if extract_response_parent_id(&ch).is_some() {
+        return None;
+    }
+    let delta = extract_qwen_sse_delta(&ch)?;
+    full_text.append(&delta);
+    if delta.phase == QwenPhase::ThinkingSummary || delta.phase == QwenPhase::Thinking {
+        return None;
+    }
+    let text = delta.text;
+    if text.is_empty() && !delta.finished {
+        return None;
+    }
+    Some(build_stream_chunk(
+        completion_id, model, created,
+        serde_json::json!({"content": text}),
+        if delta.finished { Some("stop") } else { None },
+    ))
 }
 
 fn tools_fingerprint(v: &serde_json::Value) -> u64 {
@@ -493,119 +525,135 @@ async fn handler(
 
         let has_tools = !tools.is_empty();
         let sse_stream = futures::stream::unfold(
-            (rx, String::new(), String::new()),
-            move |(rx, mut buf, mut full_text)| {
+            (rx, String::new(), AccumulatedText::new(), false),
+            move |(rx, mut buf, mut full_text, done)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let completion_id = completion_id.clone();
                 let model = model.clone();
                 async move {
-                match rx.recv().await {
-                    Ok(Ok(chunk)) => {
-                        buf.push_str(&chunk);
-                        let mut events = Vec::new();
-                        loop {
-                            if let Some(nl) = buf.find('\n') {
+                    if done {
+                        return None;
+                    }
+                    match rx.recv().await {
+                        Ok(Ok(chunk)) => {
+                            buf.push_str(&chunk);
+                            let mut oai_chunks = Vec::new();
+                            loop {
+                                let nl = match buf.find('\n') {
+                                    Some(p) => p,
+                                    None => break,
+                                };
                                 let line = buf[..nl].to_string();
                                 buf = buf[nl + 1..].to_string();
-                                if let Some(data) = parse_qwen_sse_line(&line) {
-                                    if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
-                                        if let Some(pid) = extract_response_parent_id(&ch) {
-                                            *parent_store.lock().await = Some(pid);
+                                let data = match parse_qwen_sse_line(&line) {
+                                    Some(d) => d,
+                                    None => continue,
+                                };
+                                if data == "[DONE]" {
+                                    continue;
+                                }
+                                if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
+                                    if let Some(pid) = extract_response_parent_id(&ch) {
+                                        *parent_store.lock().await = Some(pid);
+                                    }
+                                    if let Some(delta) = extract_qwen_sse_delta(&ch) {
+                                        full_text.append(&delta);
+                                        if delta.phase == QwenPhase::Answer || delta.phase == QwenPhase::Other(_) {
+                                            if !delta.text.is_empty() {
+                                                oai_chunks.push(build_stream_chunk(
+                                                    &completion_id, &model, created,
+                                                    serde_json::json!({"content": &delta.text}),
+                                                    None,
+                                                ));
+                                            }
+                                            if delta.finished {
+                                                oai_chunks.push(build_stream_chunk(
+                                                    &completion_id, &model, created,
+                                                    serde_json::json!({}),
+                                                    Some("stop"),
+                                                ));
+                                            }
                                         }
-                                        append_sse_delta(&mut full_text, &ch);
                                     }
                                 }
-                                let tc = detect_tool(&full_text, &tools);
+                                let tc = detect_tool(full_text.full_answer(), &tools);
                                 if tc.is_some() {
                                     break;
                                 }
-                            } else {
-                                break;
                             }
-                        }
-
-                        let tc = detect_tool(&full_text, &tools);
-                        if let Some(tc) = tc {
-                            info!(tool = %tc.name, "Detected tool call (streaming)");
-                            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-                            for chunk_str in build_tool_call_stream_chunks(
-                                &completion_id, &model, created, &tool_call_id, &tc.name, &args,
-                            ) {
-                                events.push(format!("data: {}\n\n", chunk_str));
-                            }
-                        }
-                        let chunk_str = events.join("");
-                        Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(chunk_str))), (rx, buf, full_text)))
-                    }
-                    Ok(Err(err_str)) => {
-                        let err_chunk = format!(
-                            "data: {}\n\ndata: [DONE]\n\n",
-                            build_stream_chunk(
-                                &completion_id, &model, created,
-                                serde_json::json!({"content": format!("[Error: {}]", err_str)}),
-                                Some("stop")
-                            )
-                        );
-                        Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text)))
-                    }
-                    Err(_) => {
-                        let tc = detect_tool(&full_text, &tools);
-                        let mut final_chunks = String::new();
-
-                        if let Some(tc) = tc {
-                            info!(tool = %tc.name, "Detected tool call (streaming)");
-                            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-                            for chunk_str in build_tool_call_stream_chunks(
-                                &completion_id, &model, created, &tool_call_id, &tc.name, &args,
-                            ) {
-                                final_chunks.push_str(&format!("data: {}\n\n", chunk_str));
-                            }
-                        } else {
-                            let mut emitted_role = false;
-                            let visible = client_visible_content(&full_text, None, has_tools);
-                            let content_bytes = visible.as_bytes();
-                            let chunk_size = 16;
-                            for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
-                                let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
-                                let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
-                                if !emitted_role {
-                                    emitted_role = true;
-                                    final_chunks.push_str(&format!(
-                                        "data: {}\n\n",
-                                        build_stream_chunk(
-                                            &completion_id, &model, created,
-                                            serde_json::json!({"role": "assistant", "content": piece.to_string()}),
-                                            None
-                                        )
-                                    ));
-                                } else {
-                                    final_chunks.push_str(&format!(
-                                        "data: {}\n\n",
-                                        build_stream_chunk(
-                                            &completion_id, &model, created,
-                                            serde_json::json!({"content": piece.to_string()}),
-                                            None
-                                        )
-                                    ));
+                            let tc = detect_tool(full_text.full_answer(), &tools);
+                            if let Some(tc) = tc {
+                                info!(tool = %tc.name, "Detected tool call");
+                                let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                for s in build_tool_call_stream_chunks(&completion_id, &model, created, &tid, &tc.name, &args) {
+                                    oai_chunks.push(s);
                                 }
                             }
-                            final_chunks.push_str(&format!(
-                                "data: {}\n\ndata: [DONE]\n\n",
-                                build_stream_chunk(
-                                    &completion_id, &model, created,
-                                    serde_json::json!({}),
-                                    Some("stop")
-                                )
-                            ));
+                            if !oai_chunks.is_empty() {
+                                let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                                Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, false)))
+                            } else {
+                                Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, false)))
+                            }
                         }
-
-                        Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text)))
+                        Ok(Err(err_str)) => {
+                            let err_chunk = format!(
+                                "data: {}\n\ndata: [DONE]\n\n",
+                                build_stream_chunk(&completion_id, &model, created,
+                                    serde_json::json!({"content": format!("[Error: {}]", err_str)}),
+                                    Some("stop"),
+                                )
+                            );
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, true)))
+                        }
+                        Err(_) => {
+                            let tc = detect_tool(full_text.full_answer(), &tools);
+                            let mut final_chunks = String::new();
+                            if let Some(tc) = tc {
+                                info!(tool = %tc.name, "Detected tool call");
+                                let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                for s in build_tool_call_stream_chunks(&completion_id, &model, created, &tid, &tc.name, &args) {
+                                    final_chunks.push_str(&format!("data: {}\n\n", s));
+                                }
+                            } else {
+                                let visible = client_visible_content(full_text.full_answer(), None, has_tools);
+                                let content_bytes = visible.as_bytes();
+                                if !content_bytes.is_empty() {
+                                    final_chunks.push_str(&format!(
+                                        "data: {}\n\n",
+                                        build_stream_chunk(&completion_id, &model, created,
+                                            serde_json::json!({"role": "assistant", "content": ""}),
+                                            None,
+                                        )
+                                    ));
+                                    let chunk_size = 16;
+                                    for chunk_start in (0..content_bytes.len()).step_by(chunk_size) {
+                                        let chunk_end = std::cmp::min(chunk_start + chunk_size, content_bytes.len());
+                                        let piece = String::from_utf8_lossy(&content_bytes[chunk_start..chunk_end]);
+                                        final_chunks.push_str(&format!(
+                                            "data: {}\n\n",
+                                            build_stream_chunk(&completion_id, &model, created,
+                                                serde_json::json!({"content": piece.to_string()}),
+                                                None,
+                                            )
+                                        ));
+                                    }
+                                }
+                                final_chunks.push_str(&format!(
+                                    "data: {}\n\ndata: [DONE]\n\n",
+                                    build_stream_chunk(&completion_id, &model, created,
+                                        serde_json::json!({}),
+                                        Some("stop"),
+                                    )
+                                ));
+                            }
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, true)))
+                        }
                     }
                 }
-            }
             },
         );
 
@@ -648,7 +696,7 @@ async fn handler(
             Ok(body_text)
         }).await {
             Ok(body_text) => {
-                let mut full_text = String::new();
+                let mut acc = AccumulatedText::new();
                 for line in body_text.lines() {
                     if let Some(data) = parse_qwen_sse_line(line) {
                         if data == "[DONE]" { continue; }
@@ -656,11 +704,12 @@ async fn handler(
                             if let Some(pid) = extract_response_parent_id(&ch) {
                                 session.set_parent_id(pid).await;
                             }
-                            append_sse_delta(&mut full_text, &ch);
+                            append_sse_delta(&mut acc, &ch);
                         }
                     }
                 }
 
+                let full_text = acc.full_answer().to_string();
                 let completion_tokens = estimate_tokens(&full_text);
                 let total_tokens = prompt_tokens + completion_tokens;
 
