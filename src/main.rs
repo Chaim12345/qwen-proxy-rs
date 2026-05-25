@@ -590,10 +590,10 @@ async fn handler(
                                     }
                                     prev_len = visible.len();
                                 }
-                                if !oai_chunks.is_empty() {
-                                    let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, false, content_emitted, false, prev_len, prev_thinking_len)));
-                                }
+                            }
+                            if !oai_chunks.is_empty() {
+                                let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len)));
                             }
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len)))
                         }
