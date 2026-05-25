@@ -37,11 +37,10 @@ fn sanitize_tool_args(args: &Value) -> Value {
 /// True when text still looks like a tool call after normalization (even if parse failed).
 pub fn looks_like_tool_call_attempt(text: &str) -> bool {
     let cleaned = normalize_tool_call_text(text);
-    cleaned.contains("\"tool\":")
+    cleaned.contains("```")
+        || cleaned.contains("\"tool\":")
         || cleaned.contains("\"tool_calls\":")
         || cleaned.contains("\"function\":")
-        || cleaned.contains("```json")
-        || cleaned.contains("```\n{")
 }
 
 /// Text safe to return as assistant `content` to OpenAI clients (never leak raw tool JSON).
@@ -722,6 +721,14 @@ mod tests {
         let raw = r#"{"tool":"bash","args":{"command":"ls"}}"#;
         assert_eq!(client_visible_content(raw, None, true), "");
         assert_eq!(client_visible_content("hello", None, true), "hello");
+    }
+
+    #[test]
+    fn test_looks_like_tool_call_backtick() {
+        assert!(looks_like_tool_call_attempt("```json\n{\"tool\":\"bash\"}"));
+        assert!(looks_like_tool_call_attempt("```"));
+        assert!(looks_like_tool_call_attempt("text ```json more"));
+        assert!(!looks_like_tool_call_attempt("hello world"));
     }
 
     #[test]
