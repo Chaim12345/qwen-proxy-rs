@@ -546,12 +546,10 @@ async fn handler(
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
                                     return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len)));
                                 }
-                                if has_tools {
-                                    let answer = full_text.full_answer().to_string();
-                                    let visible = client_visible_content(&answer, None, true);
-                                    if !visible.is_empty() {
-                                        content_emitted = true;
-                                    }
+                                let answer = full_text.full_answer().to_string();
+                                let visible = client_visible_content(&answer, None, has_tools);
+                                if !visible.is_empty() {
+                                    content_emitted = true;
                                 }
                             }
                             if !tool_emitted && (!has_tools || content_emitted) {
