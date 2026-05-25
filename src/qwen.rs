@@ -422,15 +422,11 @@ pub fn build_message(v: &Value) -> String {
     }
 
     if has_tools {
-        result.push_str("\n\n⚠️ IMPORTANT TOOL USE INSTRUCTIONS:\n");
-        result.push_str("When you need to use a tool, you MUST output EXACTLY this JSON format and NOTHING ELSE:\n");
-        result.push_str("{\"tool\":\"tool_name\",\"args\":{\"param1\":\"value1\"}}\n");
-        result.push_str(
-            "Do NOT wrap it in markdown. Do NOT add any explanation text before or after.\n",
-        );
-        result.push_str(
-            "The JSON must be on a single line. Output ONLY the tool JSON when using a tool.\n",
-        );
+        result.push_str("\n\n## Tool Use Format\n");
+        result.push_str("When you need to call a tool, output a fenced code block with language `json`:\n");
+        result.push_str("```json\n{\"tool\":\"tool_name\",\"args\":{...}}\n```\n");
+        result.push_str("Always wrap the tool JSON in a markdown code block. Never output raw JSON outside a code block.\n");
+        result.push_str("Never add text after the code block. The code block must be the last thing you output.\n");
     }
 
     result
@@ -696,8 +692,12 @@ mod tests {
         assert!(msg.contains("You are helpful"), "system prompt included");
         assert!(msg.contains("USER: Hello"), "user message included");
         assert!(
-            msg.contains("TOOL USE INSTRUCTIONS"),
+            msg.contains("Tool Use Format"),
             "tool instructions present"
+        );
+        assert!(
+            msg.contains("```json"),
+            "code block instruction present"
         );
     }
 
