@@ -115,17 +115,6 @@ fn internal_error(message: impl Into<String>) -> Response<Full<Bytes>> {
     )
 }
 
-fn tool_error(message: impl Into<String>, tools: &[serde_json::Value]) -> Response<Full<Bytes>> {
-    let mut err = serde_json::json!({
-        "message": message.into(),
-        "type": "server_error",
-    });
-    if !tools.is_empty() {
-        err["available_tools"] = serde_json::json!(tools);
-    }
-    json_response(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({"error": err}))
-}
-
 fn not_found_response() -> Response<Full<Bytes>> {
     json_response(
         StatusCode::NOT_FOUND,
@@ -269,39 +258,6 @@ fn append_sse_delta(acc: &mut AccumulatedText, ch: &serde_json::Value) {
     if let Some(delta) = extract_qwen_sse_delta(ch) {
         acc.append(&delta);
     }
-}
-
-#[allow(dead_code)]
-fn sse_line_to_openai(
-    line: &str,
-    completion_id: &str,
-    model: &str,
-    created: i64,
-    _has_tools: bool,
-    full_text: &mut AccumulatedText,
-) -> Option<String> {
-    let data = parse_qwen_sse_line(line)?;
-    if data == "[DONE]" {
-        return None;
-    }
-    let ch: serde_json::Value = serde_json::from_str(&data).ok()?;
-    if extract_response_parent_id(&ch).is_some() {
-        return None;
-    }
-    let delta = extract_qwen_sse_delta(&ch)?;
-    full_text.append(&delta);
-    if delta.phase == QwenPhase::ThinkingSummary || delta.phase == QwenPhase::Thinking {
-        return None;
-    }
-    let text = delta.text;
-    if text.is_empty() && !delta.finished {
-        return None;
-    }
-    Some(build_stream_chunk(
-        completion_id, model, created,
-        serde_json::json!({"content": text}),
-        if delta.finished { Some("stop") } else { None },
-    ))
 }
 
 fn tools_fingerprint(v: &serde_json::Value) -> u64 {

@@ -129,7 +129,7 @@ pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
         return Some(text[..end].to_string());
     }
 
-    if text.len() < 100 && (text.contains("抱歉") || text.contains("sorry") && text.contains("tool")) {
+    if text.len() < 100 && (text.contains("抱歉") || (text.contains("sorry") && text.contains("tool"))) {
         let end = text.find('.').unwrap_or(text.len().min(200));
         return Some(text[..end].to_string());
     }
@@ -144,19 +144,6 @@ pub enum QwenPhase {
     Search,
     Answer,
     Other(String),
-}
-
-impl QwenPhase {
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &str {
-        match self {
-            QwenPhase::ThinkingSummary => "thinking_summary",
-            QwenPhase::Thinking => "thinking",
-            QwenPhase::Search => "search",
-            QwenPhase::Answer => "answer",
-            QwenPhase::Other(s) => s.as_str(),
-        }
-    }
 }
 
 pub struct QwenSseDelta {
@@ -750,7 +737,9 @@ mod tests {
             "response": {"content": "Hello"},
             "content": ""
         });
-        assert_eq!(extract_qwen_sse_delta(&ch).as_deref(), Some("Hello"));
+        let delta = extract_qwen_sse_delta(&ch);
+        assert!(delta.is_some());
+        assert_eq!(delta.unwrap().text, "Hello");
     }
 
     #[test]
@@ -768,7 +757,9 @@ mod tests {
             "choices": [{"delta": {"phase": "answer"}}],
             "content": "world"
         });
-        assert_eq!(extract_qwen_sse_delta(&ch).as_deref(), Some("world"));
+        let delta = extract_qwen_sse_delta(&ch);
+        assert!(delta.is_some());
+        assert_eq!(delta.unwrap().text, "world");
     }
 
 }
