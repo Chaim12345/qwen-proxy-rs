@@ -492,8 +492,8 @@ async fn handler(
 
         let has_tools = !tools.is_empty();
         let sse_stream = futures::stream::unfold(
-            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize),
-            move |(rx, mut buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len)| {
+            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize),
+            move |(rx, mut buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let completion_id = completion_id.clone();
@@ -535,6 +535,16 @@ async fn handler(
                                 }
                             }
                             let mut oai_chunks: Vec<String> = Vec::new();
+                            let thinking = full_text.thinking();
+                            if thinking.len() > prev_thinking_len {
+                                let delta = &thinking[prev_thinking_len..];
+                                oai_chunks.push(build_stream_chunk(
+                                    &completion_id, &model, created,
+                                    serde_json::json!({"thinking": delta}),
+                                    None,
+                                ));
+                                prev_thinking_len = thinking.len();
+                            }
                             if !tool_emitted && !content_emitted {
                                 let tc = detect_tool(full_text.full_answer(), &tools);
                                 if let Some(tc) = tc {
@@ -545,7 +555,7 @@ async fn handler(
                                         oai_chunks.push(s);
                                     }
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len)));
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len)));
                                 }
                                 let answer = full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
@@ -582,10 +592,10 @@ async fn handler(
                                 }
                                 if !oai_chunks.is_empty() {
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, false, content_emitted, false, prev_len)));
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, false, content_emitted, false, prev_len, prev_thinking_len)));
                                 }
                             }
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len)))
                         }
                         Ok(Err(err_str)) => {
                             let err_chunk = format!(
@@ -595,7 +605,7 @@ async fn handler(
                                     Some("stop"),
                                 )
                             );
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)))
                         }
                         Err(_) => {
                             let mut final_chunks = String::new();
@@ -612,7 +622,7 @@ async fn handler(
                                             )
                                         ));
                                         final_chunks.push_str("data: [DONE]\n\n");
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len)));
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)));
                                     }
                                 }
                                 let tc = detect_tool(&answer, &tools);
@@ -637,7 +647,7 @@ async fn handler(
                                 }
                             }
                             final_chunks.push_str("data: [DONE]\n\n");
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)))
                         }
                     }
                 }

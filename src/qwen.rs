@@ -217,6 +217,10 @@ impl AccumulatedText {
     pub fn full_answer(&self) -> &str {
         &self.answer
     }
+
+    pub fn thinking(&self) -> &str {
+        &self.thinking
+    }
 }
 
 pub fn extract_qwen_sse_delta(ch: &Value) -> Option<QwenSseDelta> {
