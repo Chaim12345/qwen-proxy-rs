@@ -457,7 +457,7 @@ fn client_session_key(v: &serde_json::Value) -> String {
                     .unwrap_or_default();
                 if !content.is_empty() {
                     // fix(#2): use fnv1a_hash instead of DefaultHasher
-                    return format!("conv:{:x}{}", fnv1a_hash(content), tools_suffix);
+                    return format!("conv:{:x}{}", fnv1a_hash(&content), tools_suffix);
                 }
             }
         }
