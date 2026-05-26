@@ -11,13 +11,13 @@ static SPINNER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[\u280B-\u283F]|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏").unwrap()
 });
 
-static THINKING_RE: LazyLock<Regex> =
+static THINKING_ARTIFACT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)Thinking\.{0,3}").unwrap());
 
 /// Strip spinner/thinking artifacts before tool-call parsing.
 pub fn normalize_tool_call_text(text: &str) -> String {
     let step1 = SPINNER_RE.replace_all(text, "");
-    THINKING_RE.replace_all(&step1, "").into_owned()
+    THINKING_ARTIFACT_RE.replace_all(&step1, "").into_owned()
 }
 
 fn sanitize_tool_args(args: &Value) -> Value {
@@ -34,7 +34,8 @@ fn sanitize_tool_args(args: &Value) -> Value {
     Value::Object(out)
 }
 
-/// True when text still looks like a tool call after normalization (even if parse failed).
+/// True when text looks like it *might* contain a tool call (cheap check).
+/// Used as a guard before running the full detect_tools scan.
 pub fn looks_like_tool_call_attempt(text: &str) -> bool {
     let cleaned = normalize_tool_call_text(text);
     cleaned.contains("```")
@@ -43,7 +44,10 @@ pub fn looks_like_tool_call_attempt(text: &str) -> bool {
         || cleaned.contains("\"function\":")
 }
 
-/// Text safe to return as assistant `content` to OpenAI clients (never leak raw tool JSON).
+/// Text safe to return as assistant `content` to OpenAI clients.
+/// Only suppresses content when the text *successfully parses* as a tool call,
+/// not just when it superficially looks like one. This prevents hiding
+/// legitimate code blocks or JSON responses when tools are enabled.
 pub fn client_visible_content(
     full_text: &str,
     tool_call: Option<&ToolCall>,
@@ -52,8 +56,18 @@ pub fn client_visible_content(
     if tool_call.is_some() {
         return String::new();
     }
-    if tools_present && looks_like_tool_call_attempt(full_text) {
-        return String::new();
+    if tools_present {
+        // Only suppress if we can actually parse a tool call out of the text
+        let normalized = normalize_tool_call_text(full_text);
+        // Fast path: if it doesn't even look like a tool call, show it
+        if !looks_like_tool_call_attempt(&normalized) {
+            return full_text.to_string();
+        }
+        // Slow path: only suppress if detect_tools finds something
+        let dummy_tools: Vec<Value> = vec![];
+        if !detect_tools_internal(full_text, &dummy_tools, true).is_empty() {
+            return String::new();
+        }
     }
     full_text.to_string()
 }
@@ -285,6 +299,16 @@ pub fn extract_qwen_sse_delta(ch: &Value) -> Option<QwenSseDelta> {
                 }
             }
         }
+    } else if phase == QwenPhase::Thinking {
+        // Thinking phase: extract content from delta.content first, then fallbacks
+        text = extract_string_value(
+            delta
+                .and_then(|d| d.get("content"))
+                .unwrap_or(&Value::Null),
+        );
+        if text.is_empty() {
+            text = extract_string_value(ch.get("content").unwrap_or(&Value::Null));
+        }
     } else {
         text = extract_string_value(
             delta
@@ -302,10 +326,25 @@ pub fn extract_qwen_sse_delta(ch: &Value) -> Option<QwenSseDelta> {
         }
     }
 
-    if text.is_empty() && !finished {
-        None
-    } else {
-        Some(QwenSseDelta { phase, text, finished })
+    // For thinking phases: return Some even with empty text if finished,
+    // so the AccumulatedText state machine knows the phase ended.
+    // For answer phases: return None only if truly nothing to report.
+    match phase {
+        QwenPhase::Thinking | QwenPhase::ThinkingSummary => {
+            if text.is_empty() && !finished {
+                None
+            } else {
+                Some(QwenSseDelta { phase, text, finished })
+            }
+        }
+        QwenPhase::Search => None, // search phase never emits visible content
+        _ => {
+            if text.is_empty() && !finished {
+                None
+            } else {
+                Some(QwenSseDelta { phase, text, finished })
+            }
+        }
     }
 }
 
@@ -585,29 +624,22 @@ fn accept_tool_call(tc: ToolCall, tool_names: &[&str]) -> Option<ToolCall> {
     }
 }
 
-/// Detect tool calls in text using multiple strategies:
-/// 1. Markdown code blocks containing JSON
-/// 2. Proper JSON parsing with string/escape handling
-/// 3. Line-by-line scanning for tool-like patterns
-/// Returns all unique tool calls found.
-pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
+/// Internal detect_tools with optional any-tool mode (tool_names empty = accept all).
+fn detect_tools_internal(text: &str, tool_defs: &[Value], accept_any: bool) -> Vec<ToolCall> {
     let normalized = normalize_tool_call_text(text);
-    let tool_names: Vec<&str> = tool_defs
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
-
-    debug!(
-        text_len = normalized.len(),
-        tool_names = ?tool_names,
-        text_preview = %&normalized[..normalized.len().min(200)],
-        "Starting tool detection"
-    );
+    let tool_names: Vec<&str> = if accept_any {
+        vec![]
+    } else {
+        tool_defs.iter().filter_map(|t| t["name"].as_str()).collect()
+    };
 
     let mut found: Vec<ToolCall> = Vec::new();
 
+    // Deduplicate by (name, canonical args JSON) — not just name,
+    // so the same tool called twice with different args is kept.
     let mut add_unique = |tc: ToolCall| {
-        if !found.contains(&tc) {
+        let args_key = serde_json::to_string(&tc.args).unwrap_or_default();
+        if !found.iter().any(|f| f.name == tc.name && serde_json::to_string(&f.args).unwrap_or_default() == args_key) {
             found.push(tc);
         }
     };
@@ -649,12 +681,27 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
         }
     }
 
-    if found.is_empty() {
+    found
+}
+
+/// Detect tool calls in text using multiple strategies:
+/// 1. Markdown code blocks containing JSON
+/// 2. Proper JSON parsing with string/escape handling
+/// 3. Line-by-line scanning for tool-like patterns
+/// Returns all unique tool calls found (deduplicated by name+args).
+pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
+    debug!(
+        text_len = text.len(),
+        text_preview = %&text[..text.len().min(200)],
+        "Starting tool detection"
+    );
+    let result = detect_tools_internal(text, tool_defs, false);
+    if result.is_empty() {
         debug!("No tool call detected in text");
     } else {
-        debug!(count = found.len(), "Tool calls detected");
+        debug!(count = result.len(), "Tool calls detected");
     }
-    found
+    result
 }
 
 
@@ -710,11 +757,9 @@ mod tests {
 
     #[test]
     fn test_detect_tool_nested_braces_in_string() {
-        // This is the key test - args contain braces inside a string value
         let text = r#"{"tool":"bash","args":{"command":"echo {hello}"}}"#;
         let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
-        let tcs =
-            detect_tools(text, &tools);
+        let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].name, "bash");
         assert_eq!(tcs[0].args["command"], "echo {hello}");
@@ -751,6 +796,17 @@ mod tests {
         assert_eq!(tcs.len(), 2, "should detect both tool calls");
         assert_eq!(tcs[0].name, "read");
         assert_eq!(tcs[1].name, "write");
+    }
+
+    #[test]
+    fn test_detect_same_tool_different_args() {
+        // Same tool called twice with different args — both should be kept
+        let text = "```json\n{\"tool\":\"write\",\"args\":{\"path\":\"a.txt\",\"content\":\"A\"}}\n```\n```json\n{\"tool\":\"write\",\"args\":{\"path\":\"b.txt\",\"content\":\"B\"}}\n```";
+        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
+        let tcs = detect_tools(text, &tools);
+        assert_eq!(tcs.len(), 2, "same tool with different args should both be kept");
+        assert_eq!(tcs[0].args["path"], "a.txt");
+        assert_eq!(tcs[1].args["path"], "b.txt");
     }
 
     #[test]
@@ -795,7 +851,9 @@ mod tests {
     #[test]
     fn test_client_visible_content_hides_tool_json() {
         let raw = r#"{"tool":"bash","args":{"command":"ls"}}"#;
+        // With tools_present=true and a valid tool JSON, content should be hidden
         assert_eq!(client_visible_content(raw, None, true), "");
+        // Plain text should always be shown
         assert_eq!(client_visible_content("hello", None, true), "hello");
     }
 
@@ -813,12 +871,12 @@ mod tests {
         let end = find_json_object_end(text, 0).expect("should find end");
         assert_eq!(end, text.len() - 1);
     }
+
     #[test]
     fn test_extract_qwen_sse_delta_answer_phase() {
+        // delta.content is checked first, then response.content fallback
         let ch = serde_json::json!({
-            "choices": [{"delta": {"phase": "answer", "content": ""}}],
-            "response": {"content": "Hello"},
-            "content": ""
+            "choices": [{"delta": {"phase": "answer", "content": "Hello"}}],
         });
         let delta = extract_qwen_sse_delta(&ch);
         assert!(delta.is_some());
@@ -826,12 +884,28 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_qwen_sse_delta_skips_thinking() {
+    fn test_extract_qwen_sse_delta_answer_phase_fallback() {
+        // When delta.content is empty, falls back to response.content
         let ch = serde_json::json!({
-            "choices": [{"delta": {"phase": "thinking", "content": "secret"}}],
-            "response": {"content": "should not appear"}
+            "choices": [{"delta": {"phase": "answer", "content": ""}}],
+            "response": {"content": "Hello"},
         });
-        assert!(extract_qwen_sse_delta(&ch).is_none());
+        let delta = extract_qwen_sse_delta(&ch);
+        assert!(delta.is_some());
+        assert_eq!(delta.unwrap().text, "Hello");
+    }
+
+    #[test]
+    fn test_extract_qwen_sse_delta_thinking_phase_returns_delta() {
+        // Thinking phase now returns Some(delta) so AccumulatedText.thinking is populated
+        let ch = serde_json::json!({
+            "choices": [{"delta": {"phase": "thinking", "content": "secret thought"}}],
+        });
+        let delta = extract_qwen_sse_delta(&ch);
+        assert!(delta.is_some(), "thinking phase should return Some(delta)");
+        let d = delta.unwrap();
+        assert_eq!(d.phase, QwenPhase::Thinking);
+        assert_eq!(d.text, "secret thought");
     }
 
     #[test]
