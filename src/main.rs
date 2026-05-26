@@ -214,6 +214,7 @@ fn build_tool_call_stream_chunks(
     args_json: &str,
 ) -> Vec<String> {
     let mut chunks = Vec::new();
+    // Header chunk: announce the tool call with its name
     chunks.push(build_stream_chunk(
         id,
         model,
@@ -231,8 +232,11 @@ fn build_tool_call_stream_chunks(
         None,
     ));
 
+    // Stream arguments in larger chunks to reduce SSE frame count.
+    // 8 bytes per chunk was causing 25+ frames for a typical 200-byte args JSON.
+    // 256 bytes balances streaming granularity with per-frame overhead.
+    let chunk_size = 256;
     let args_bytes = args_json.as_bytes();
-    let chunk_size = 8;
     for chunk_start in (0..args_bytes.len()).step_by(chunk_size) {
         let chunk_end = std::cmp::min(chunk_start + chunk_size, args_bytes.len());
         let arg_piece = String::from_utf8_lossy(&args_bytes[chunk_start..chunk_end]);
@@ -262,6 +266,20 @@ fn append_sse_delta(acc: &mut AccumulatedText, ch: &serde_json::Value) {
     if let Some(delta) = extract_qwen_sse_delta(ch) {
         acc.append(&delta);
     }
+}
+
+/// Returns true if the SSE delta signals that Qwen has finished the answer phase.
+/// Used as a sentinel to allow early tool emission mid-stream only when the full
+/// answer text is guaranteed to be in the buffer.
+fn delta_is_finished(ch: &serde_json::Value) -> bool {
+    ch.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.get("status"))
+        .and_then(|s| s.as_str())
+        .map(|s| s == "finished")
+        .unwrap_or(false)
 }
 
 fn tools_fingerprint(v: &serde_json::Value) -> u64 {
@@ -495,6 +513,7 @@ async fn handler(
 
         let has_tools = !tools.is_empty();
         let sse_stream = futures::stream::unfold(
+            // State tuple: (rx, buf, full_text, tool_emitted, content_emitted, done, prev_len, prev_thinking_len)
             (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize),
             move |(rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len)| {
                 let parent_store = parent_store.clone();
@@ -508,10 +527,15 @@ async fn handler(
                     }
                     match rx.recv().await {
                         Ok(Ok(line)) => {
+                            // Parse the incoming SSE line and accumulate text.
+                            let mut answer_finished = false;
                             if let Some(data) = parse_qwen_sse_line(&line) {
                                 if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
                                     if let Some(pid) = extract_response_parent_id(&ch) {
                                         *parent_store.lock().await = Some(pid);
+                                    }
+                                    if delta_is_finished(&ch) {
+                                        answer_finished = true;
                                     }
                                     if let Some(delta) = extract_qwen_sse_delta(&ch) {
                                         full_text.append(&delta);
@@ -519,6 +543,8 @@ async fn handler(
                                 }
                             }
                             let mut oai_chunks: Vec<String> = Vec::new();
+
+                            // Emit incremental thinking tokens.
                             let thinking = full_text.thinking();
                             if thinking.len() > prev_thinking_len {
                                 let delta = &thinking[prev_thinking_len..];
@@ -529,29 +555,41 @@ async fn handler(
                                 ));
                                 prev_thinking_len = thinking.len();
                             }
-                            if !tool_emitted && !content_emitted {
-                                let tcs = detect_tools(full_text.full_answer(), &tools);
-                                if !tcs.is_empty() {
-                                    for (i, tc) in tcs.iter().enumerate() {
-                                        info!(tool = %tc.name, index = i, "Detected tool call");
-                                        let tid = format!("call_{}", uuid::Uuid::new_v4());
-                                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
-                                        for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
-                                            oai_chunks.push(s);
+
+                            // Tool emission: only when Qwen signals the answer phase is
+                            // finished (answer_finished sentinel). This prevents firing on
+                            // partial text mid-stream which caused only the first tool call
+                            // to be returned when multiple tools were requested.
+                            //
+                            // The expensive detect_tools (3-pass scan) is guarded by
+                            // looks_like_tool_call_attempt so it doesn't run on every chunk.
+                            if !tool_emitted && !content_emitted && answer_finished {
+                                let answer = full_text.full_answer();
+                                if has_tools && looks_like_tool_call_attempt(answer) {
+                                    let tcs = detect_tools(answer, &tools);
+                                    if !tcs.is_empty() {
+                                        for (i, tc) in tcs.iter().enumerate() {
+                                            info!(tool = %tc.name, index = i, "Detected tool call (answer finished)");
+                                            let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                            for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
+                                                oai_chunks.push(s);
+                                            }
                                         }
+                                        let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                                        // tool_emitted = true so we never double-emit
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len)));
                                     }
-                                    let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len)));
                                 }
+                            }
+
+                            // Regular content streaming (non-tool path).
+                            if !tool_emitted && (!has_tools || content_emitted) {
                                 let answer = full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
                                 if !visible.is_empty() {
                                     content_emitted = true;
                                 }
-                            }
-                            if !tool_emitted && (!has_tools || content_emitted) {
-                                let answer = full_text.full_answer().to_string();
-                                let visible = client_visible_content(&answer, None, has_tools);
                                 let visible = if rf.is_some() {
                                     strip_json_codeblock(&visible)
                                 } else {
@@ -577,6 +615,7 @@ async fn handler(
                                     prev_len = visible.len();
                                 }
                             }
+
                             if !oai_chunks.is_empty() {
                                 let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
                                 return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len)));
@@ -594,6 +633,9 @@ async fn handler(
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)))
                         }
                         Err(_) => {
+                            // Stream ended (channel closed). Run final tool detection on the
+                            // complete accumulated answer. This is the primary path for
+                            // multi-tool detection since all tool JSON is now buffered.
                             let mut final_chunks = String::new();
                             if !tool_emitted && !content_emitted {
                                 let answer = full_text.full_answer().to_string();
@@ -611,6 +653,7 @@ async fn handler(
                                         return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)));
                                     }
                                 }
+                                // Run full detection on complete answer text.
                                 let tcs = detect_tools(&answer, &tools);
                                 if !tcs.is_empty() {
                                     for (i, tc) in tcs.iter().enumerate() {
