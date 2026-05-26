@@ -4,35 +4,37 @@
 //!  - Uses VecDeque to buffer lines; no intermediate Vec + push-front reversal.
 //!  - poll_next yields one line per call instead of only the first of a batch.
 //!  - post_sse() exposed so main.rs can call it directly (was never imported before).
+//!  - request_id is Arc<str> — clone per SSE line is a refcount bump, not a heap alloc.
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{debug, error, trace};
 
 pub struct SseLine {
     pub raw: String,
-    pub request_id: String,
+    pub request_id: Arc<str>,
 }
 
 pub struct QwenSseStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     buf: String,
     ready: VecDeque<String>,
-    request_id: String,
+    request_id: Arc<str>,
     finished: bool,
 }
 
 impl QwenSseStream {
     pub fn new(resp: reqwest::Response) -> Self {
-        let request_id = resp
+        let request_id: Arc<str> = resp
             .headers()
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
-            .to_string();
+            .into();
         debug!(status = %resp.status(), request_id = %request_id, "Qwen SSE stream opened");
         Self {
             inner: Box::pin(resp.bytes_stream()),
@@ -60,7 +62,7 @@ impl Stream for QwenSseStream {
             if let Some(line) = self.ready.pop_front() {
                 return Poll::Ready(Some(Ok(SseLine {
                     raw: line,
-                    request_id: self.request_id.clone(),
+                    request_id: Arc::clone(&self.request_id),
                 })));
             }
             if self.finished {
@@ -68,7 +70,7 @@ impl Stream for QwenSseStream {
                     let line = std::mem::take(&mut self.buf);
                     return Poll::Ready(Some(Ok(SseLine {
                         raw: line,
-                        request_id: self.request_id.clone(),
+                        request_id: Arc::clone(&self.request_id),
                     })));
                 }
                 return Poll::Ready(None);
