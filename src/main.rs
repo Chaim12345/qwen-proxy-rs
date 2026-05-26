@@ -231,8 +231,9 @@ fn build_tool_call_stream_chunks(
         None,
     ));
 
+    // Increased from 8 to 256 to reduce SSE frame count
     let args_bytes = args_json.as_bytes();
-    let chunk_size = 8;
+    let chunk_size = 256;
     for chunk_start in (0..args_bytes.len()).step_by(chunk_size) {
         let chunk_end = std::cmp::min(chunk_start + chunk_size, args_bytes.len());
         let arg_piece = String::from_utf8_lossy(&args_bytes[chunk_start..chunk_end]);
@@ -345,6 +346,12 @@ fn qwen_request_headers(token: &str) -> Vec<(String, String)> {
         ("version".to_string(), "0.8.0".to_string()),
         ("cookie".to_string(), format!("token={}", token)),
     ]
+}
+
+/// Returns true if the accumulated answer text looks like it might contain a tool call,
+/// so we can skip the expensive detect_tools scan on every regular text chunk.
+fn looks_like_tool_call_attempt(answer: &str) -> bool {
+    answer.contains("```") || answer.contains("\"tool\":") || answer.contains("{\"tool\"")
 }
 
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
@@ -541,51 +548,21 @@ async fn handler(
                                 ));
                                 prev_thinking_len = thinking.len();
                             }
-                            if !tool_emitted && !content_emitted {
+                            // Only scan for tool calls mid-stream if the answer looks like it
+                            // might contain one — avoids running detect_tools on every chunk.
+                            // Tool calls are definitively detected at stream-end (Err branch).
+                            if !tool_emitted && !content_emitted && has_tools
+                                && looks_like_tool_call_attempt(full_text.full_answer())
+                            {
                                 let tcs = detect_tools(full_text.full_answer(), &tools);
                                 if !tcs.is_empty() {
-                                    for (i, tc) in tcs.iter().enumerate() {
-                                        info!(tool = %tc.name, index = i, "Detected tool call");
-                                        let tid = format!("call_{}", uuid::Uuid::new_v4());
-                                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
-                                        if is_responses_api {
-                                            if !output_started {
-                                                oai_chunks.push(serde_json::to_string(&serde_json::json!({
-                                                    "type": "response.output_item.added",
-                                                    "output_index": i,
-                                                    "item": {
-                                                        "id": tid,
-                                                        "type": "function_call",
-                                                        "call_id": tid.clone(),
-                                                        "name": tc.name,
-                                                        "arguments": "",
-                                                    }
-                                                })).unwrap_or_default());
-                                                item_id = tid.clone();
-                                                output_started = true;
-                                            }
-                                            oai_chunks.push(serde_json::to_string(&serde_json::json!({
-                                                "type": "response.function_call_arguments.delta",
-                                                "item_id": tid,
-                                                "output_index": i,
-                                                "delta": args,
-                                            })).unwrap_or_default());
-                                        } else {
-                                            for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
-                                                oai_chunks.push(s);
-                                            }
-                                        }
-                                    }
-                                    let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
-                                }
-                                let answer = full_text.full_answer().to_string();
-                                let visible = client_visible_content(&answer, None, has_tools);
-                                if !visible.is_empty() {
-                                    content_emitted = true;
+                                    // Do NOT set tool_emitted here — wait for stream-end
+                                    // to ensure all tool calls are accumulated before emitting.
+                                    // Just note that content should be suppressed.
+                                    content_emitted = false;
                                 }
                             }
-                            if !tool_emitted && (!has_tools || content_emitted) {
+                            if !tool_emitted {
                                 let answer = full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
                                 let visible = if rf.is_some() {
@@ -593,7 +570,10 @@ async fn handler(
                                 } else {
                                     visible
                                 };
-                                if visible.len() > prev_len {
+                                if !visible.is_empty() && !has_tools {
+                                    content_emitted = true;
+                                }
+                                if visible.len() > prev_len && (!has_tools || content_emitted) {
                                     let delta = &visible[prev_len..];
                                     if is_responses_api {
                                         if !output_started {
@@ -653,9 +633,11 @@ async fn handler(
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
                         }
                         Err(_) => {
+                            // Stream ended — this is the definitive place to detect tools.
                             let mut final_chunks = String::new();
+                            let answer = full_text.full_answer().to_string();
+
                             if !tool_emitted && !content_emitted {
-                                let answer = full_text.full_answer().to_string();
                                 if has_tools {
                                     if let Some(err_msg) = detect_qwen_tool_error(&answer) {
                                         error!(error = %err_msg, "Qwen returned tool error in stream");
@@ -676,6 +658,7 @@ async fn handler(
                                         return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
                                     }
                                 }
+                                // Definitive tool detection on the full accumulated answer
                                 let tcs = detect_tools(&answer, &tools);
                                 if !tcs.is_empty() {
                                     if is_responses_api {
@@ -770,7 +753,8 @@ async fn handler(
                                     }
                                 })).unwrap_or_default()));
                             } else {
-                                if tool_emitted {
+                                let tcs_final = detect_tools(&answer, &tools);
+                                if !tcs_final.is_empty() {
                                     final_chunks.push_str(&format!(
                                         "data: {}\n\n",
                                         build_stream_chunk(&completion_id, &model, created,
