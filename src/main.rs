@@ -269,7 +269,9 @@ fn build_tool_call_stream_chunks(
     }
 
     chunks.push(build_stream_chunk(
-        id, model, created,
+        id,
+        model,
+        created,
         serde_json::json!({}),
         Some("tool_calls"),
     ));
@@ -285,7 +287,12 @@ fn append_sse_delta(acc: &mut AccumulatedText, ch: &serde_json::Value) {
 /// Phase 3: small helper for best-effort detached feedback in stream error paths.
 /// Client-visible error is emitted immediately; the send is spawned (no await, no added latency).
 /// Reuses the send_qwen_chat_continuation (from 3.1) which handles logs, timeout, None-on-fail.
-fn spawn_feedback_if_hallucinated(chat_id: String, parent_id: Option<String>, fb: String, token: String) {
+fn spawn_feedback_if_hallucinated(
+    chat_id: String,
+    parent_id: Option<String>,
+    fb: String,
+    token: String,
+) {
     tokio::spawn(async move {
         let _ = send_qwen_chat_continuation(&chat_id, parent_id.as_deref(), &fb, &token).await;
     });
@@ -294,7 +301,10 @@ fn spawn_feedback_if_hallucinated(chat_id: String, parent_id: Option<String>, fb
 /// Small helper to DRY the 400 error shape for bad tool names (used by raw-body + non-stream validate err paths).
 /// (The non-stream detect_qwen_tool_error path uses a similar shape but with upstream err_msg, so keeps local build.)
 /// Keeps "available_tools" for client debugging (per Phase 2/4).
-fn construct_tool_error_json(bad_names: &[String], tools: &[serde_json::Value]) -> serde_json::Value {
+fn construct_tool_error_json(
+    bad_names: &[String],
+    tools: &[serde_json::Value],
+) -> serde_json::Value {
     let mut err = serde_json::json!({
         "message": format!("Invalid tool call(s): {}. Only use exact names from the client's Available Tools list.", bad_names.join(", ")),
         "type": "invalid_request_error",
@@ -394,7 +404,8 @@ async fn tool_gate_nonstream(
 fn fnv1a_hash(s: &str) -> u64 {
     const OFFSET: u64 = 14695981039346656037;
     const PRIME: u64 = 1099511628211;
-    s.bytes().fold(OFFSET, |h, b| (h ^ b as u64).wrapping_mul(PRIME))
+    s.bytes()
+        .fold(OFFSET, |h, b| (h ^ b as u64).wrapping_mul(PRIME))
 }
 
 fn tools_fingerprint(v: &serde_json::Value) -> u64 {
@@ -449,7 +460,9 @@ fn client_session_key(v: &serde_json::Value) -> String {
                                     part.get("text")
                                         .and_then(|v| v.as_str())
                                         .or_else(|| part.get("input_text").and_then(|v| v.as_str()))
-                                        .or_else(|| part.get("output_text").and_then(|v| v.as_str()))
+                                        .or_else(|| {
+                                            part.get("output_text").and_then(|v| v.as_str())
+                                        })
                                 })
                             })
                         })
@@ -537,10 +550,18 @@ async fn handler(
     let msg = build_message(&v);
     let tools = parse_tools(&v);
 
-    debug!(messages = messages.len(), stream = is_stream, "Processing request");
+    debug!(
+        messages = messages.len(),
+        stream = is_stream,
+        "Processing request"
+    );
 
     let client_key = client_session_key(&v);
-    let (session, session_id, parent_id, parent_store) = match st.sessions.acquire(&client_key, &st.token).await {
+    let (session, session_id, parent_id, parent_store) = match st
+        .sessions
+        .acquire(&client_key, &st.token)
+        .await
+    {
         Ok(s) => {
             let sid = s.chat_id.clone();
             let pid = s.parent_id.clone();
@@ -554,7 +575,10 @@ async fn handler(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            return Ok(openai_error_response(status, e.to_string(), "server_error", None, None).map(|b| box_body(b)));
+            return Ok(
+                openai_error_response(status, e.to_string(), "server_error", None, None)
+                    .map(|b| box_body(b)),
+            );
         }
     };
 
@@ -575,7 +599,9 @@ async fn handler(
     };
 
     let upstream_model = crate::constants::qwen_upstream_model(
-        v.get("model").and_then(|m| m.as_str()).filter(|m| !m.is_empty()),
+        v.get("model")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty()),
     );
     let payload = qwen_payload(&session_id, parent_id.as_deref(), &prompt, &upstream_model);
 
@@ -1091,15 +1117,21 @@ async fn handler(
                     let preview: String = body_text.chars().take(500).collect();
                     error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
                     if status == 429 || body_text.contains("in progress") {
-                        return Ok(internal_error("Qwen chat is busy (another message in flight on this chat_id)").map(|b| box_body(b)));
+                        return Ok(internal_error(
+                            "Qwen chat is busy (another message in flight on this chat_id)",
+                        )
+                        .map(|b| box_body(b)));
                     }
-                    return Ok(internal_error(format!("Qwen API returned {}", status)).map(|b| box_body(b)));
+                    return Ok(internal_error(format!("Qwen API returned {}", status))
+                        .map(|b| box_body(b)));
                 }
                 // body_text now from blocking ureq; proceed with original line processing (includes set_parent_id awaits)
                 let mut acc = AccumulatedText::new();
                 for line in body_text.lines() {
                     if let Some(data) = parse_qwen_sse_line(line) {
-                        if data == "[DONE]" { continue; }
+                        if data == "[DONE]" {
+                            continue;
+                        }
                         if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
                             if let Some(pid) = extract_response_parent_id(&ch) {
                                 session.set_parent_id(pid).await;
@@ -1122,7 +1154,8 @@ async fn handler(
                             "rate_limit_exceeded",
                             None,
                             Some("rate_limit"),
-                        ).map(|b| box_body(b)));
+                        )
+                        .map(|b| box_body(b)));
                     }
                 }
 
@@ -1150,7 +1183,14 @@ async fn handler(
                             // Same fb synthesis + await send + set + 400 as the full_text non-stream path (now DRY-able via helper)
                             let fb = build_tool_hallucination_feedback(&bad_names);
                             if let Some(pid) = &latest_pid {
-                                match send_qwen_chat_continuation(&session_id, Some(pid), &fb, &st.token).await {
+                                match send_qwen_chat_continuation(
+                                    &session_id,
+                                    Some(pid),
+                                    &fb,
+                                    &st.token,
+                                )
+                                .await
+                                {
                                     Ok(Some(new_pid)) => {
                                         session.set_parent_id(new_pid.clone()).await;
                                         info!(
@@ -1171,24 +1211,30 @@ async fn handler(
                                 warn!(chat_id = %session_id, "Phase 3: no latest_pid captured in raw body; skipping injection (still 400)");
                             }
                             let err_body = construct_tool_error_json(&bad_names, &tools);
-                            return Ok(json_response(StatusCode::BAD_REQUEST, &err_body).map(|b| box_body(b)));
+                            return Ok(json_response(StatusCode::BAD_REQUEST, &err_body)
+                                .map(|b| box_body(b)));
                         }
                     };
                     if !tcs.is_empty() {
-                        let tool_calls: Vec<serde_json::Value> = tcs.iter().enumerate().map(|(i, tc)| {
-                            info!(tool = %tc.name, index = i, "Detected tool call in raw body");
-                            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-                            serde_json::json!({
-                                "index": i,
-                                "id": tool_call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": args
-                                }
+                        let tool_calls: Vec<serde_json::Value> = tcs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, tc)| {
+                                info!(tool = %tc.name, index = i, "Detected tool call in raw body");
+                                let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
+                                let args = serde_json::to_string(&tc.args)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                serde_json::json!({
+                                    "index": i,
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": args
+                                    }
+                                })
                             })
-                        }).collect();
+                            .collect();
                         let resp_value = serde_json::json!({
                             "id": completion_id,
                             "object": "chat.completion",
@@ -1209,7 +1255,10 @@ async fn handler(
                                 "total_tokens": prompt_tokens
                             }
                         });
-                        info!(count = tcs.len(), "Returning tool calls from raw body (validated Phase 4.1)");
+                        info!(
+                            count = tcs.len(),
+                            "Returning tool calls from raw body (validated Phase 4.1)"
+                        );
                         return Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)));
                     }
                 }
@@ -1220,9 +1269,16 @@ async fn handler(
                         // Phase 3: feedback injection for non-stream detect_qwen_tool_error (closes coverage gap;
                         // stream detect_qwen paths already had spawn; now uniform with validate errs per plan §3.3).
                         // Uses same await+set_parent pattern as the sibling non-stream validate err arm below.
-                                        let fb = build_qwen_tool_error_feedback(&err_msg);
+                        let fb = build_qwen_tool_error_feedback(&err_msg);
                         if let Some(pid) = &latest_pid {
-                            match send_qwen_chat_continuation(&session_id, Some(pid), &fb, &st.token).await {
+                            match send_qwen_chat_continuation(
+                                &session_id,
+                                Some(pid),
+                                &fb,
+                                &st.token,
+                            )
+                            .await
+                            {
                                 Ok(Some(new_pid)) => {
                                     session.set_parent_id(new_pid.clone()).await;
                                     info!(
@@ -1250,7 +1306,8 @@ async fn handler(
                         return Ok(json_response(
                             StatusCode::BAD_REQUEST,
                             &serde_json::json!({"error": err}),
-                        ).map(|b| box_body(b)));
+                        )
+                        .map(|b| box_body(b)));
                     }
                 }
 
@@ -1278,7 +1335,14 @@ async fn handler(
                         // client_session_key continue *after* the halluc + correction (in-context training signal).
                         let fb = build_tool_hallucination_feedback(&bad_names);
                         if let Some(pid) = &latest_pid {
-                            match send_qwen_chat_continuation(&session_id, Some(pid), &fb, &st.token).await {
+                            match send_qwen_chat_continuation(
+                                &session_id,
+                                Some(pid),
+                                &fb,
+                                &st.token,
+                            )
+                            .await
+                            {
                                 Ok(Some(new_pid)) => {
                                     session.set_parent_id(new_pid.clone()).await;
                                     info!(
@@ -1300,7 +1364,9 @@ async fn handler(
                         }
                         // Phase 4.1: using shared constructor (DRY with raw-body path)
                         let err_body = construct_tool_error_json(&bad_names, &tools);
-                        return Ok(json_response(StatusCode::BAD_REQUEST, &err_body).map(|b| box_body(b)));
+                        return Ok(
+                            json_response(StatusCode::BAD_REQUEST, &err_body).map(|b| box_body(b))
+                        );
                     }
                 };
 
@@ -1314,20 +1380,25 @@ async fn handler(
                 }
 
                 let resp_value = if !tcs.is_empty() {
-                    let tool_calls: Vec<serde_json::Value> = tcs.iter().enumerate().map(|(i, tc)| {
-                        info!(tool = %tc.name, index = i, "Detected tool call");
-                        let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
-                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-                        serde_json::json!({
-                            "index": i,
-                            "id": tool_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": args
-                            }
+                    let tool_calls: Vec<serde_json::Value> = tcs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tc)| {
+                            info!(tool = %tc.name, index = i, "Detected tool call");
+                            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
+                            let args = serde_json::to_string(&tc.args)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            serde_json::json!({
+                                "index": i,
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": args
+                                }
+                            })
                         })
-                    }).collect();
+                        .collect();
 
                     if is_responses_api {
                         let output: Vec<serde_json::Value> = tcs.iter().map(|tc| {
@@ -1375,19 +1446,21 @@ async fn handler(
                     }
                 } else {
                     let visible = client_visible_content(&full_text, None, !tools.is_empty());
-                    let visible = match process_structured_output(&visible, response_format.as_ref()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!(error = %e, "Structured output processing failed");
-                            return Ok(openai_error_response(
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                e,
-                                "invalid_response_error",
-                                None,
-                                None,
-                            ).map(|b| box_body(b)));
-                        }
-                    };
+                    let visible =
+                        match process_structured_output(&visible, response_format.as_ref()) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                error!(error = %e, "Structured output processing failed");
+                                return Ok(openai_error_response(
+                                    StatusCode::UNPROCESSABLE_ENTITY,
+                                    e,
+                                    "invalid_response_error",
+                                    None,
+                                    None,
+                                )
+                                .map(|b| box_body(b)));
+                            }
+                        };
                     info!(len = visible.len(), "Returning text response");
 
                     if is_responses_api {
@@ -1441,9 +1514,7 @@ async fn handler(
     }
 }
 
-async fn embeddings_handler(
-    req: Request<Incoming>,
-) -> Result<Response<BoxBody>, Infallible> {
+async fn embeddings_handler(req: Request<Incoming>) -> Result<Response<BoxBody>, Infallible> {
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
@@ -1479,7 +1550,8 @@ async fn embeddings_handler(
                 "total_tokens": tokens
             }
         }),
-    ).map(|b| box_body(b)))
+    )
+    .map(|b| box_body(b)))
 }
 
 async fn router(
@@ -1491,9 +1563,18 @@ async fn router(
 
     let cors = |resp: Response<BoxBody>| {
         let (mut parts, body) = resp.into_parts();
-        parts.headers.insert("access-control-allow-origin", http::HeaderValue::from_static("*"));
-        parts.headers.insert("access-control-allow-methods", http::HeaderValue::from_static("*"));
-        parts.headers.insert("access-control-allow-headers", http::HeaderValue::from_static("*"));
+        parts.headers.insert(
+            "access-control-allow-origin",
+            http::HeaderValue::from_static("*"),
+        );
+        parts.headers.insert(
+            "access-control-allow-methods",
+            http::HeaderValue::from_static("*"),
+        );
+        parts.headers.insert(
+            "access-control-allow-headers",
+            http::HeaderValue::from_static("*"),
+        );
         Response::from_parts(parts, body)
     };
 
@@ -1516,15 +1597,12 @@ async fn router(
         (Method::POST, "/v1/chat/completions") | (Method::POST, "/v1/responses") => {
             handler(req, st).await.unwrap()
         }
-        (Method::POST, "/v1/embeddings") => {
-            embeddings_handler(req).await.unwrap()
-        }
-        (Method::GET, "/") | (Method::GET, "") => {
-            json_response(
-                StatusCode::OK,
-                &serde_json::json!({"message": "Qwen OpenAI Proxy (smol+hyper)", "version": "0.1.0"}),
-            ).map(|b| box_body(b))
-        }
+        (Method::POST, "/v1/embeddings") => embeddings_handler(req).await.unwrap(),
+        (Method::GET, "/") | (Method::GET, "") => json_response(
+            StatusCode::OK,
+            &serde_json::json!({"message": "Qwen OpenAI Proxy (smol+hyper)", "version": "0.1.0"}),
+        )
+        .map(|b| box_body(b)),
         _ => {
             if method == Method::POST {
                 handler(req, st).await.unwrap()
@@ -1562,7 +1640,10 @@ fn main() -> Result<()> {
         .unwrap_or(8765);
     let addr = format!("0.0.0.0:{}", port);
 
-    info!("Qwen OpenAI proxy (tokio+hyper) listening on http://{}", addr);
+    info!(
+        "Qwen OpenAI proxy (tokio+hyper) listening on http://{}",
+        addr
+    );
 
     let term = Arc::new(AtomicBool::new(false));
     if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term)) {
@@ -1599,9 +1680,8 @@ fn main() -> Result<()> {
                     let state = state.clone();
                     tokio::spawn(async move {
                         let stream = TokioIo::new(stream);
-                        let service = service_fn(move |req: Request<Incoming>| {
-                            router(req, state.clone())
-                        });
+                        let service =
+                            service_fn(move |req: Request<Incoming>| router(req, state.clone()));
 
                         if let Err(e) = http1::Builder::new()
                             .keep_alive(true)

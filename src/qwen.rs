@@ -7,12 +7,10 @@ static MARKDOWN_CODE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"```(?:json)?\s*([\s\S]+?)```").unwrap());
 
 /// Spinner / Braille patterns leaked into streamed Qwen output.
-static SPINNER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[\u280B-\u283F]|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏").unwrap()
-});
+static SPINNER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\u280B-\u283F]|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏").unwrap());
 
-static THINKING_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)Thinking\.{0,3}").unwrap());
+static THINKING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)Thinking\.{0,3}").unwrap());
 
 /// Strip spinner/thinking artifacts before tool-call parsing.
 pub fn normalize_tool_call_text(text: &str) -> String {
@@ -27,7 +25,9 @@ pub fn normalize_tool_call_text(text: &str) -> String {
 /// Conservative list only (no fuzzy); false-positive risk mitigated by exact-first + tests.
 pub fn normalize_tool_name(name: &str) -> String {
     let mut n = name.trim().to_lowercase();
-    for p in ["get_", "run_", "bash_", "execute_", "tool_", "cursor_", "api_"] {
+    for p in [
+        "get_", "run_", "bash_", "execute_", "tool_", "cursor_", "api_",
+    ] {
         if let Some(s) = n.strip_prefix(p) {
             n = s.to_string();
             break;
@@ -71,7 +71,9 @@ fn is_tool_name_allowed(requested: &str, allowed: &[&str]) -> Option<String> {
 }
 
 fn sanitize_tool_args(args: &Value) -> Value {
-    let Some(obj) = args.as_object() else { return args.clone(); };
+    let Some(obj) = args.as_object() else {
+        return args.clone();
+    };
     let mut out = serde_json::Map::new();
     for (key, value) in obj {
         let clean = key.trim();
@@ -85,9 +87,7 @@ fn sanitize_tool_args(args: &Value) -> Value {
 /// True when text still looks like a tool call after normalization (even if parse failed).
 pub fn looks_like_tool_call_attempt(text: &str) -> bool {
     let cleaned = normalize_tool_call_text(text);
-    cleaned.contains("```")
-        || cleaned.contains("\"tool\":")
-        || cleaned.contains("{\"tool\"")
+    cleaned.contains("```") || cleaned.contains("\"tool\":") || cleaned.contains("{\"tool\"")
 }
 
 /// Text safe to return as assistant `content` to OpenAI clients (never leak raw tool JSON).
@@ -134,7 +134,9 @@ fn extract_string_value(v: &Value) -> String {
 /// Extract assistant-visible text from one Qwen SSE JSON chunk (mirrors qtalt proxies).
 pub fn parse_qwen_upstream_error(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if !trimmed.starts_with('{') { return None; }
+    if !trimmed.starts_with('{') {
+        return None;
+    }
     let v: Value = serde_json::from_str(trimmed).ok()?;
     if v.get("success").and_then(|s| s.as_bool()) != Some(false) {
         return None;
@@ -160,7 +162,10 @@ pub fn strip_json_codeblock(text: &str) -> String {
 
 /// Process response content for structured output (response_format).
 pub fn process_structured_output(text: &str, rf: Option<&Value>) -> Result<String, String> {
-    let rf = match rf { Some(r) => r, None => return Ok(text.to_string()) };
+    let rf = match rf {
+        Some(r) => r,
+        None => return Ok(text.to_string()),
+    };
     let rf_type = rf.get("type").and_then(|t| t.as_str());
     if rf_type != Some("json_schema") && rf_type != Some("json_object") {
         return Ok(text.to_string());
@@ -177,12 +182,18 @@ pub fn process_structured_output(text: &str, rf: Option<&Value>) -> Result<Strin
 
 /// Detect tool-related error messages in Qwen response text.
 pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
-    if text.is_empty() { return None; }
-    if text.contains("Tool ") && (text.contains(" does not exist") || text.contains(" does not exists")) {
+    if text.is_empty() {
+        return None;
+    }
+    if text.contains("Tool ")
+        && (text.contains(" does not exist") || text.contains(" does not exists"))
+    {
         let end = text.find('.').unwrap_or(text.len());
         return Some(text[..end].to_string());
     }
-    if (text.contains("cannot use") || text.contains("can't use") || text.contains("unable to use")) && text.contains("tool") {
+    if (text.contains("cannot use") || text.contains("can't use") || text.contains("unable to use"))
+        && text.contains("tool")
+    {
         let end = text.find('.').unwrap_or(text.len().min(200));
         return Some(text[..end].to_string());
     }
@@ -190,7 +201,9 @@ pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
         let end = text.find('.').unwrap_or(text.len().min(200));
         return Some(text[..end].to_string());
     }
-    if text.len() < 100 && (text.contains("抱歉") || (text.contains("sorry") && text.contains("tool"))) {
+    if text.len() < 100
+        && (text.contains("抱歉") || (text.contains("sorry") && text.contains("tool")))
+    {
         let end = text.find('.').unwrap_or(text.len().min(200));
         return Some(text[..end].to_string());
     }
@@ -219,7 +232,10 @@ pub struct AccumulatedText {
 
 impl AccumulatedText {
     pub fn new() -> Self {
-        AccumulatedText { thinking: String::new(), answer: String::new() }
+        AccumulatedText {
+            thinking: String::new(),
+            answer: String::new(),
+        }
     }
 
     pub fn append(&mut self, delta: &QwenSseDelta) {
@@ -239,8 +255,12 @@ impl AccumulatedText {
         }
     }
 
-    pub fn full_answer(&self) -> &str { &self.answer }
-    pub fn thinking(&self) -> &str { &self.thinking }
+    pub fn full_answer(&self) -> &str {
+        &self.answer
+    }
+    pub fn thinking(&self) -> &str {
+        &self.thinking
+    }
 }
 
 /// Extract delta text from a Qwen SSE JSON chunk.
@@ -265,7 +285,13 @@ pub fn extract_qwen_sse_delta(ch: &Value) -> Option<QwenSseDelta> {
         "thinking" => QwenPhase::Thinking,
         "search" => QwenPhase::Search,
         "answer" => QwenPhase::Answer,
-        other => if other.is_empty() { QwenPhase::Answer } else { QwenPhase::Other(other.to_string()) },
+        other => {
+            if other.is_empty() {
+                QwenPhase::Answer
+            } else {
+                QwenPhase::Other(other.to_string())
+            }
+        }
     };
 
     let finished = delta
@@ -282,26 +308,37 @@ pub fn extract_qwen_sse_delta(ch: &Value) -> Option<QwenSseDelta> {
         if let Some(extra) = delta.as_ref().and_then(|d| d.get("extra")) {
             if let Some(title) = extra.get("summary_title").and_then(|s| s.get("content")) {
                 if let Some(arr) = title.as_array() {
-                    for item in arr { if let Some(s) = item.as_str() { text.push_str(s); } }
-                } else if let Some(s) = title.as_str() { text.push_str(s); }
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            text.push_str(s);
+                        }
+                    }
+                } else if let Some(s) = title.as_str() {
+                    text.push_str(s);
+                }
             }
             if let Some(thought) = extra.get("summary_thought").and_then(|s| s.get("content")) {
                 if let Some(arr) = thought.as_array() {
                     for item in arr {
                         if let Some(s) = item.as_str() {
-                            if !text.is_empty() { text.push('\n'); }
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
                             text.push_str(s);
                         }
                     }
                 } else if let Some(s) = thought.as_str() {
-                    if !text.is_empty() { text.push('\n'); }
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
                     text.push_str(s);
                 }
             }
         }
         // Fallback: some Qwen versions put thinking text directly in delta.content as array
         if text.is_empty() {
-            text = extract_string_value(delta.and_then(|d| d.get("content")).unwrap_or(&Value::Null));
+            text =
+                extract_string_value(delta.and_then(|d| d.get("content")).unwrap_or(&Value::Null));
         }
     } else {
         // Normal answer phase
@@ -319,13 +356,21 @@ pub fn extract_qwen_sse_delta(ch: &Value) -> Option<QwenSseDelta> {
 
     // Always return a delta for thinking phases so the stream can accumulate them
     if phase == QwenPhase::ThinkingSummary || phase == QwenPhase::Thinking {
-        return Some(QwenSseDelta { phase, text, finished });
+        return Some(QwenSseDelta {
+            phase,
+            text,
+            finished,
+        });
     }
 
     if text.is_empty() && !finished {
         None
     } else {
-        Some(QwenSseDelta { phase, text, finished })
+        Some(QwenSseDelta {
+            phase,
+            text,
+            finished,
+        })
     }
 }
 
@@ -487,12 +532,15 @@ pub async fn send_qwen_chat_continuation(
 }
 
 fn message_content_to_string(content: &Value) -> String {
-    if let Some(text) = content.as_str() { return text.to_string(); }
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
     if let Some(parts) = content.as_array() {
         return parts
             .iter()
             .filter_map(|part| {
-                part.get("text").and_then(|v| v.as_str())
+                part.get("text")
+                    .and_then(|v| v.as_str())
                     .or_else(|| part.get("output_text").and_then(|v| v.as_str()))
                     .or_else(|| part.get("input_text").and_then(|v| v.as_str()))
                     .or_else(|| part.get("output").and_then(|v| v.as_str()))
@@ -564,7 +612,9 @@ pub fn build_message(v: &Value) -> String {
     if let Some(rf) = v.get("response_format") {
         match rf.get("type").and_then(|t| t.as_str()) {
             Some("json_schema") => {
-                result.push_str("\n\nRespond with valid JSON only (no markdown) matching this schema:\n");
+                result.push_str(
+                    "\n\nRespond with valid JSON only (no markdown) matching this schema:\n",
+                );
                 if let Some(schema) = rf.get("json_schema").and_then(|s| s.get("schema")) {
                     result.push_str(&schema.to_string());
                 }
@@ -583,15 +633,23 @@ pub fn build_message(v: &Value) -> String {
         result.push_str("You may **only** call tools whose exact `name` appears in the Available Tools list provided by the client. Never invent, guess, or hallucinate tool names. If no tool is needed, respond in normal text without any JSON.\n\n");
 
         // Extract one real example tool name from the request for a concrete few-shot style example
-        let example_tool = v.get("tools")
+        let example_tool = v
+            .get("tools")
             .and_then(|t| t.as_array())
             .and_then(|arr| arr.first())
-            .and_then(|t| t.get("function").and_then(|f| f.get("name")).or_else(|| t.get("name")))
+            .and_then(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .or_else(|| t.get("name"))
+            })
             .and_then(|n| n.as_str())
             .unwrap_or("example_tool");
 
         result.push_str("When you need to call a tool, output **only** a single complete fenced code block with language `json` as the very last thing in your response (nothing after it):\n");
-        result.push_str(&format!("```json\n{{\"tool\":\"{}\",\"args\":{{...}}}}\n```\n", example_tool));
+        result.push_str(&format!(
+            "```json\n{{\"tool\":\"{}\",\"args\":{{...}}}}\n```\n",
+            example_tool
+        ));
         result.push_str("Always wrap the tool JSON in a markdown code block. Never output raw JSON outside a code block.\n");
         result.push_str("The code block must contain nothing except the JSON object and must be the absolute last output you produce.\n");
         result.push_str("Use the exact tool name spelling from the client's list — no prefixes, no suffixes, no made-up variations.\n");
@@ -640,15 +698,26 @@ fn find_json_object_end(text: &str, start: usize) -> Option<usize> {
     let mut escape = false;
 
     for (i, &ch) in bytes.iter().enumerate().skip(start) {
-        if escape { escape = false; continue; }
-        if ch == b'\\' && in_string { escape = true; continue; }
-        if ch == b'"' { in_string = !in_string; continue; }
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == b'\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if ch == b'"' {
+            in_string = !in_string;
+            continue;
+        }
         if !in_string {
             match ch {
                 b'{' => depth += 1,
                 b'}' => {
                     depth -= 1;
-                    if depth == 0 { return Some(i); }
+                    if depth == 0 {
+                        return Some(i);
+                    }
                 }
                 _ => {}
             }
@@ -662,11 +731,18 @@ fn try_parse_tool_json(json_str: &str) -> Option<ToolCall> {
     match serde_json::from_str::<Value>(&normalized) {
         Ok(parsed) => {
             let name = parsed.get("tool")?.as_str()?.trim();
-            if name.is_empty() { return None; }
+            if name.is_empty() {
+                return None;
+            }
             let args = parsed.get("args")?;
-            if !args.is_object() { return None; }
+            if !args.is_object() {
+                return None;
+            }
             debug!(tool = %name, "Successfully parsed tool call from JSON");
-            Some(ToolCall { name: name.to_string(), args: sanitize_tool_args(args) })
+            Some(ToolCall {
+                name: name.to_string(),
+                args: sanitize_tool_args(args),
+            })
         }
         Err(e) => {
             debug!(error = %e, json_preview = %&normalized[..normalized.len().min(100)],
@@ -751,10 +827,7 @@ pub fn validate_tool_calls_with_flags(
     pass_through: bool,
     synthetic_ok: bool,
 ) -> ToolGateResult {
-    let allowed_names: Vec<&str> = allowed
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
+    let allowed_names: Vec<&str> = allowed.iter().filter_map(|t| t["name"].as_str()).collect();
     let client_tool_count = allowed_names.len();
 
     let mut emit = Vec::new();
@@ -871,10 +944,14 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     // (Layer 4 norm happens inside accept_tool_call for all strategies)
     for cap in MARKDOWN_CODE_RE.captures_iter(&normalized) {
         let json_str = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
+        if let Some(tc) =
+            try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names))
+        {
             debug!(strategy = "markdown_code_block", tool = %tc.name, "Tool detected");
             used_codeblock_path = true;
-            if !found.contains(&tc) { found.push(tc); }
+            if !found.contains(&tc) {
+                found.push(tc);
+            }
         }
     }
     // Short-circuit: if Strategy 1 found results, skip costlier strategies (#11)
@@ -892,9 +969,13 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     // Strategy 2: scan for JSON objects that explicitly contain "tool" key
     let blocks = extract_json_blocks(&normalized);
     for json_str in blocks.iter().filter(|b| b.contains("\"tool\"")) {
-        if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
+        if let Some(tc) =
+            try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names))
+        {
             debug!(strategy = "json_object_scan", tool = %tc.name, "Tool detected");
-            if !found.contains(&tc) { found.push(tc); }
+            if !found.contains(&tc) {
+                found.push(tc);
+            }
         }
     }
     // Short-circuit: if Strategy 2 found results, skip Strategy 3 (#11)
@@ -916,9 +997,13 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
             if let Some(start) = trimmed.find('{') {
                 if let Some(end) = find_json_object_end(trimmed, start) {
                     let json_str = &trimmed[start..=end];
-                    if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
+                    if let Some(tc) = try_parse_tool_json(json_str)
+                        .and_then(|tc| accept_tool_call(tc, &tool_names))
+                    {
                         debug!(strategy = "line_scan", tool = %tc.name, "Tool detected");
-                        if !found.contains(&tc) { found.push(tc); }
+                        if !found.contains(&tc) {
+                            found.push(tc);
+                        }
                     }
                 }
             }
@@ -929,7 +1014,10 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     if found.is_empty() {
         debug!(client_tool_count, "No tool call detected in text");
     } else {
-        debug!(count = found.len(), client_tool_count, "Tool calls detected");
+        debug!(
+            count = found.len(),
+            client_tool_count, "Tool calls detected"
+        );
     }
     info!(
         client_tool_count,
@@ -958,7 +1046,7 @@ mod tests {
     #[test]
     fn test_detect_tool_simple() {
         let text = r#"{"tool":"write","args":{"path":"test.txt","content":"hello"}}"#;
-        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})]; 
+        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].name, "write");
@@ -967,7 +1055,7 @@ mod tests {
     #[test]
     fn test_detect_tool_in_markdown() {
         let text = "Here is the tool call:\n```json\n{\"tool\":\"bash\",\"args\":{\"command\":\"ls\"}}\n```\nDone.";
-        let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})]; 
+        let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].name, "bash");
@@ -976,7 +1064,7 @@ mod tests {
     #[test]
     fn test_detect_tool_embedded_in_text() {
         let text = "I've created the file. {\"tool\":\"write\",\"args\":{\"path\":\"demo.py\",\"content\":\"print('hi')\"}} The file is ready.";
-        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})]; 
+        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].name, "write");
@@ -994,7 +1082,7 @@ mod tests {
     #[test]
     fn test_detect_tool_nested_braces_in_string() {
         let text = r#"{"tool":"bash","args":{"command":"echo {hello}"}}"#;
-        let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})]; 
+        let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].name, "bash");
@@ -1003,8 +1091,9 @@ mod tests {
 
     #[test]
     fn test_detect_tool_deeply_nested_json() {
-        let text = r#"{"tool":"write","args":{"path":"test.json","content":"{\"key\": \"value\"}"}}"#;
-        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})]; 
+        let text =
+            r#"{"tool":"write","args":{"path":"test.json","content":"{\"key\": \"value\"}"}}"#;
+        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].name, "write");
@@ -1013,7 +1102,7 @@ mod tests {
     #[test]
     fn test_detect_tool_escaped_quotes() {
         let text = r#"{"tool":"write","args":{"content":"He said \"hello\""}}"#;
-        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})]; 
+        let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})];
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].name, "write");
@@ -1059,8 +1148,15 @@ mod tests {
         assert!(msg.contains("Tool Use Format"), "tool instructions present");
         assert!(msg.contains("```json"), "code block instruction present");
         // Phase 1 hardening assertions
-        assert!(msg.contains("CRITICAL RULES") || msg.contains("exact `name`"), "loud 'only exact names' rule present");
-        assert!(msg.contains("exact tool name spelling from the client's list") || msg.contains("exact `name` appears"), "reinforced exact-name guidance");
+        assert!(
+            msg.contains("CRITICAL RULES") || msg.contains("exact `name`"),
+            "loud 'only exact names' rule present"
+        );
+        assert!(
+            msg.contains("exact tool name spelling from the client's list")
+                || msg.contains("exact `name` appears"),
+            "reinforced exact-name guidance"
+        );
     }
 
     #[test]
@@ -1073,7 +1169,7 @@ mod tests {
     #[test]
     fn test_detect_tool_spinner_in_args() {
         let text = r#"{"tool":"bash","args":{"⠧ Thinking...command":"echo TOOLCALL-LIVE"}}"#;
-        let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})]; 
+        let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1, "should detect tool with spinner in args");
         assert_eq!(tcs[0].name, "bash");
@@ -1115,10 +1211,17 @@ mod tests {
             }}]
         });
         let delta = extract_qwen_sse_delta(&ch);
-        assert!(delta.is_some(), "should extract thinking from extra.summary_thought");
+        assert!(
+            delta.is_some(),
+            "should extract thinking from extra.summary_thought"
+        );
         let d = delta.unwrap();
         assert_eq!(d.phase, QwenPhase::Thinking);
-        assert!(d.text.contains("think about this"), "thinking text extracted: {}", d.text);
+        assert!(
+            d.text.contains("think about this"),
+            "thinking text extracted: {}",
+            d.text
+        );
     }
 
     #[test]
@@ -1174,7 +1277,10 @@ mod tests {
             "choices": [{"delta": {"phase": "thinking", "content": ""}}]
         });
         let delta = extract_qwen_sse_delta(&ch);
-        assert!(delta.is_some(), "empty thinking phase should return Some for accumulation");
+        assert!(
+            delta.is_some(),
+            "empty thinking phase should return Some for accumulation"
+        );
         assert_eq!(delta.unwrap().text, "");
     }
 
@@ -1263,7 +1369,8 @@ Done."#;
     #[test]
     fn test_codeblock_vs_raw_json_prefers_fast_markdown_path() {
         // Reinforces that the markdown strategy (used_codeblock_path) is preferred.
-        let text = "Some thinking...\n```json\n{\"tool\":\"bash\",\"args\":{\"cmd\":\"date\"}}\n```\n";
+        let text =
+            "Some thinking...\n```json\n{\"tool\":\"bash\",\"args\":{\"cmd\":\"date\"}}\n```\n";
         let tools = vec![serde_json::json!({"name":"bash","description":"","parameters":{}})];
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
@@ -1309,7 +1416,10 @@ Done."#;
     // Phase 4.2 Layer 4 norm tests (added per finish-plan 4.2)
     #[test]
     fn test_normalize_tool_name_strips_common_agent_prefixes_suffixes() {
-        assert_eq!(normalize_tool_name("Get_Terminal_Output"), "terminal_output");
+        assert_eq!(
+            normalize_tool_name("Get_Terminal_Output"),
+            "terminal_output"
+        );
         assert_eq!(normalize_tool_name("bash_run"), "run");
         assert_eq!(normalize_tool_name("execute_command"), "command");
         assert_eq!(normalize_tool_name("cursor_foo_tool"), "foo");
@@ -1329,12 +1439,24 @@ Done."#;
         ];
         // build fake tcs as if detected with prefixed names
         let bad_prefixed = vec![
-            ToolCall { name: "get_foo".into(), args: serde_json::json!({}) },
-            ToolCall { name: "bash_terminal".into(), args: serde_json::json!({}) },
-            ToolCall { name: "unknown_weird".into(), args: serde_json::json!({}) },
+            ToolCall {
+                name: "get_foo".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "bash_terminal".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "unknown_weird".into(),
+                args: serde_json::json!({}),
+            },
         ];
         let res = validate_tool_calls_with_flags(bad_prefixed, &allowed, true, false, false);
-        assert!(matches!(res, ToolGateResult::Blocked(_)), "unknown must still be rejected even with norm");
+        assert!(
+            matches!(res, ToolGateResult::Blocked(_)),
+            "unknown must still be rejected even with norm"
+        );
         // but the goods: to test accept path + norm emit, use detect which goes thru accept
         let text = r#"```json
 {"tool":"get_foo","args":{}}
@@ -1362,7 +1484,9 @@ Done."#;
                 assert_eq!(emit.len(), 1);
                 assert_eq!(emit[0].name, "ls");
             }
-            ToolGateResult::Blocked(bads) => panic!("expected 1 good via norm, got blocked {:?}", bads),
+            ToolGateResult::Blocked(bads) => {
+                panic!("expected 1 good via norm, got blocked {:?}", bads)
+            }
         }
     }
 
@@ -1378,36 +1502,108 @@ Done."#;
         ];
         // 20+ weird invented + prefixed + case mixes + nonsense (simulating Cursor/Aider/agent toolsets)
         let mixed: Vec<ToolCall> = vec![
-            ToolCall { name: "read_file".into(), args: serde_json::json!({}) }, // good
-            ToolCall { name: "get_terminal_output".into(), args: serde_json::json!({}) },
-            ToolCall { name: "bash_run".into(), args: serde_json::json!({}) },
-            ToolCall { name: "execute_command".into(), args: serde_json::json!({}) },
-            ToolCall { name: "cursor_get_output".into(), args: serde_json::json!({}) },
-            ToolCall { name: "run_bash".into(), args: serde_json::json!({}) },
-            ToolCall { name: "tool_foo".into(), args: serde_json::json!({}) },
-            ToolCall { name: "api__call".into(), args: serde_json::json!({}) },
-            ToolCall { name: "X7y9Z".into(), args: serde_json::json!({}) },
-            ToolCall { name: "Get_File".into(), args: serde_json::json!({}) },
-            ToolCall { name: "WRITE_FILE_TOOL".into(), args: serde_json::json!({}) },
-            ToolCall { name: "listdir_cmd".into(), args: serde_json::json!({}) },
-            ToolCall { name: "search_op".into(), args: serde_json::json!({}) },
-            ToolCall { name: "cursor_write".into(), args: serde_json::json!({}) },
-            ToolCall { name: "bash_list_dir".into(), args: serde_json::json!({}) },
-            ToolCall { name: "run_foo_bar".into(), args: serde_json::json!({}) },
-            ToolCall { name: "execute_ls".into(), args: serde_json::json!({}) },
-            ToolCall { name: "tool_unknown_1".into(), args: serde_json::json!({}) },
-            ToolCall { name: "weird__name__here".into(), args: serde_json::json!({}) },
-            ToolCall { name: "API_SEARCH_V2".into(), args: serde_json::json!({}) },
-            ToolCall { name: "run_terminal".into(), args: serde_json::json!({}) }, // good (norm or exact)
-            ToolCall { name: "search".into(), args: serde_json::json!({}) }, // good
+            ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({}),
+            }, // good
+            ToolCall {
+                name: "get_terminal_output".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "bash_run".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "execute_command".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "cursor_get_output".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "run_bash".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "tool_foo".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "api__call".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "X7y9Z".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "Get_File".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "WRITE_FILE_TOOL".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "listdir_cmd".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "search_op".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "cursor_write".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "bash_list_dir".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "run_foo_bar".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "execute_ls".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "tool_unknown_1".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "weird__name__here".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "API_SEARCH_V2".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "run_terminal".into(),
+                args: serde_json::json!({}),
+            }, // good (norm or exact)
+            ToolCall {
+                name: "search".into(),
+                args: serde_json::json!({}),
+            }, // good
         ];
         let res = validate_tool_calls_with_flags(mixed.clone(), &allowed, true, false, false);
         match res {
             ToolGateResult::Blocked(bads) => {
                 for b in &bads {
                     assert!(
-                        !["read_file", "write_file", "list_dir", "run_terminal", "search"]
-                            .contains(&b.as_str()),
+                        ![
+                            "read_file",
+                            "write_file",
+                            "list_dir",
+                            "run_terminal",
+                            "search"
+                        ]
+                        .contains(&b.as_str()),
                         "good name leaked to bad list: {}",
                         b
                     );
@@ -1422,7 +1618,10 @@ Done."#;
         // Strategy comparison: pass-through emits unknown to client
         let pass = validate_tool_calls_with_flags(mixed.clone(), &allowed, true, true, false);
         match pass {
-            ToolGateResult::Emit { emit, synthetic_feedback } => {
+            ToolGateResult::Emit {
+                emit,
+                synthetic_feedback,
+            } => {
                 assert!(synthetic_feedback.is_empty());
                 let names: Vec<_> = emit.iter().map(|t| t.name.as_str()).collect();
                 assert!(names.contains(&"get_terminal_output"));

@@ -47,7 +47,10 @@ impl QwenSseStream {
     fn drain_lines(&mut self) {
         while let Some(pos) = self.buf.find('\n') {
             let line: String = self.buf.drain(..=pos).collect();
-            let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+            let line = line
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
             if !line.is_empty() {
                 self.ready.push_back(line);
             }

@@ -10,8 +10,7 @@ use serde_json::{json, Value};
 // ─── Helper functions ─────────────────────────────────
 
 fn base_url() -> String {
-    let url =
-        std::env::var("PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1:8765".to_string());
+    let url = std::env::var("PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1:8765".to_string());
     url.trim_end_matches('/')
         .trim_end_matches("/v1")
         .to_string()

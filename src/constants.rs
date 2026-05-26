@@ -43,7 +43,9 @@ pub fn tool_synthetic_ok() -> bool {
 /// are upgraded to 3.7-max unless QWEN_MODEL is set.
 pub fn qwen_upstream_model(client_requested: Option<&str>) -> String {
     static ENV_MODEL: OnceLock<Option<String>> = OnceLock::new();
-    if let Some(m) = ENV_MODEL.get_or_init(|| std::env::var("QWEN_MODEL").ok().filter(|s| !s.is_empty())) {
+    if let Some(m) =
+        ENV_MODEL.get_or_init(|| std::env::var("QWEN_MODEL").ok().filter(|s| !s.is_empty()))
+    {
         return m.clone();
     }
     match client_requested {
@@ -59,7 +61,11 @@ pub fn qwen_upstream_model(client_requested: Option<&str>) -> String {
         Some("gpt-4") | Some("gpt-4o") | Some("gpt-3.5-turbo") => MODEL_NAME.to_string(),
         Some(other) if other.starts_with("qwen3.7") => other.to_string(),
         Some(other) => {
-            tracing::warn!(client_model = other, upstream = MODEL_NAME, "Unknown client model; using upstream default");
+            tracing::warn!(
+                client_model = other,
+                upstream = MODEL_NAME,
+                "Unknown client model; using upstream default"
+            );
             MODEL_NAME.to_string()
         }
         None => MODEL_NAME.to_string(),

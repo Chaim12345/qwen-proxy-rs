@@ -126,7 +126,8 @@ impl SessionManager {
         let now = now_millis();
         let last = self.last_cleanup_ms.load(Ordering::Relaxed);
         if now.saturating_sub(last) > 60_000 {
-            if self.last_cleanup_ms
+            if self
+                .last_cleanup_ms
                 .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
