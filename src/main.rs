@@ -231,7 +231,7 @@ fn build_tool_call_stream_chunks(
         None,
     ));
 
-    // Increased from 8 to 256 to reduce SSE frame count
+    // Send args in one large chunk to minimise SSE frame count.
     let args_bytes = args_json.as_bytes();
     let chunk_size = 256;
     for chunk_start in (0..args_bytes.len()).step_by(chunk_size) {
@@ -251,6 +251,9 @@ fn build_tool_call_stream_chunks(
         ));
     }
 
+    // finish_reason is sent in a *separate* final chunk — do NOT include it
+    // together with the last arguments fragment, as some clients (e.g. openai-python)
+    // stop reading argument chunks as soon as they see a non-null finish_reason.
     chunks.push(build_stream_chunk(
         id, model, created,
         serde_json::json!({}),
@@ -504,7 +507,7 @@ async fn handler(
         let is_responses_api = is_responses_api;
         let sse_stream = futures::stream::unfold(
             (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize, false, false, String::new()),
-            move |(rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut resp_created, mut output_started, mut item_id)| {
+            move |(rx, buf, mut full_text, mut tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut resp_created, mut output_started, mut item_id)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let rf = rf_inner.clone();
@@ -548,32 +551,21 @@ async fn handler(
                                 ));
                                 prev_thinking_len = thinking.len();
                             }
-                            // Only scan for tool calls mid-stream if the answer looks like it
-                            // might contain one — avoids running detect_tools on every chunk.
-                            // Tool calls are definitively detected at stream-end (Err branch).
-                            if !tool_emitted && !content_emitted && has_tools
-                                && looks_like_tool_call_attempt(full_text.full_answer())
-                            {
-                                let tcs = detect_tools(full_text.full_answer(), &tools);
-                                if !tcs.is_empty() {
-                                    // Do NOT set tool_emitted here — wait for stream-end
-                                    // to ensure all tool calls are accumulated before emitting.
-                                    // Just note that content should be suppressed.
-                                    content_emitted = false;
-                                }
-                            }
-                            if !tool_emitted {
+                            // Mid-stream: stream text content only when there are no tools.
+                            // With tools, we accumulate and emit everything at stream-end to
+                            // ensure all tool calls are captured before any output is sent.
+                            if !tool_emitted && !has_tools {
                                 let answer = full_text.full_answer().to_string();
-                                let visible = client_visible_content(&answer, None, has_tools);
+                                let visible = client_visible_content(&answer, None, false);
                                 let visible = if rf.is_some() {
                                     strip_json_codeblock(&visible)
                                 } else {
                                     visible
                                 };
-                                if !visible.is_empty() && !has_tools {
+                                if !visible.is_empty() {
                                     content_emitted = true;
                                 }
-                                if visible.len() > prev_len && (!has_tools || content_emitted) {
+                                if visible.len() > prev_len {
                                     let delta = &visible[prev_len..];
                                     if is_responses_api {
                                         if !output_started {
@@ -633,7 +625,7 @@ async fn handler(
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
                         }
                         Err(_) => {
-                            // Stream ended — this is the definitive place to detect tools.
+                            // Stream ended — definitive place to detect tools and finalise output.
                             let mut final_chunks = String::new();
                             let answer = full_text.full_answer().to_string();
 
@@ -655,31 +647,31 @@ async fn handler(
                                                 )
                                             ));
                                         }
+                                        final_chunks.push_str("data: [DONE]\n\n");
                                         return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
                                     }
                                 }
-                                // Definitive tool detection on the full accumulated answer
+
+                                // Definitive tool detection on the full accumulated answer.
                                 let tcs = detect_tools(&answer, &tools);
                                 if !tcs.is_empty() {
+                                    tool_emitted = true;
                                     if is_responses_api {
                                         for (i, tc) in tcs.iter().enumerate() {
                                             info!(tool = %tc.name, index = i, "Detected tool call at stream end");
                                             let tid = format!("call_{}", uuid::Uuid::new_v4());
                                             let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
-                                            if !output_started {
-                                                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
-                                                    "type": "response.output_item.added",
-                                                    "output_index": i,
-                                                    "item": {
-                                                        "id": tid,
-                                                        "type": "function_call",
-                                                        "call_id": tid.clone(),
-                                                        "name": tc.name,
-                                                        "arguments": args,
-                                                    }
-                                                })).unwrap_or_default()));
-                                                output_started = true;
-                                            }
+                                            final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                "type": "response.output_item.added",
+                                                "output_index": i,
+                                                "item": {
+                                                    "id": tid,
+                                                    "type": "function_call",
+                                                    "call_id": tid.clone(),
+                                                    "name": tc.name,
+                                                    "arguments": args,
+                                                }
+                                            })).unwrap_or_default()));
                                         }
                                     } else {
                                         for (i, tc) in tcs.iter().enumerate() {
@@ -702,11 +694,12 @@ async fn handler(
                                     };
                                     if !visible.is_empty() {
                                         if is_responses_api {
+                                            let msg_id = format!("msg_{}", uuid::Uuid::new_v4());
                                             final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
                                                 "type": "response.output_item.added",
                                                 "output_index": 0,
                                                 "item": {
-                                                    "id": format!("msg_{}", uuid::Uuid::new_v4()),
+                                                    "id": msg_id,
                                                     "type": "message",
                                                     "role": "assistant",
                                                     "content": [{"type": "output_text", "text": visible, "annotations": []}]
@@ -723,7 +716,19 @@ async fn handler(
                                         }
                                     }
                                 }
+                            } else if content_emitted && !tool_emitted {
+                                // Text was already streamed mid-stream; send the final stop chunk.
+                                if !is_responses_api {
+                                    final_chunks.push_str(&format!(
+                                        "data: {}\n\n",
+                                        build_stream_chunk(&completion_id, &model, created,
+                                            serde_json::json!({}),
+                                            Some("stop"),
+                                        )
+                                    ));
+                                }
                             }
+
                             if is_responses_api {
                                 if output_started && !tool_emitted {
                                     final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
@@ -752,25 +757,6 @@ async fn handler(
                                         }
                                     }
                                 })).unwrap_or_default()));
-                            } else {
-                                let tcs_final = detect_tools(&answer, &tools);
-                                if !tcs_final.is_empty() {
-                                    final_chunks.push_str(&format!(
-                                        "data: {}\n\n",
-                                        build_stream_chunk(&completion_id, &model, created,
-                                            serde_json::json!({}),
-                                            Some("tool_calls"),
-                                        )
-                                    ));
-                                } else if content_emitted {
-                                    final_chunks.push_str(&format!(
-                                        "data: {}\n\n",
-                                        build_stream_chunk(&completion_id, &model, created,
-                                            serde_json::json!({}),
-                                            Some("stop"),
-                                        )
-                                    ));
-                                }
                             }
                             final_chunks.push_str("data: [DONE]\n\n");
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
