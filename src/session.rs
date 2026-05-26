@@ -135,7 +135,7 @@ impl SessionManager {
             }
         }
 
-        if client_key.starts_with("ephemeral:") {
+        if client_key.starts_with("ephemeral:") || client_key.starts_with("conv:") {
             let dc = self.ensure_default_chat(token).await?;
             let in_flight_guard = dc.in_flight.lock_owned().await;
             let parent_id = dc.parent_id.lock().await.clone();
