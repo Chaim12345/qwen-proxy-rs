@@ -1,15 +1,27 @@
 //! Qwen chat session management.
 //!
-//! Reusing a `chat_id` across turns is fine. Qwen returns 429 ("chat in progress") only when
-//! two messages are sent on the same chat before the prior response finishes — we serialize
-//! per-chat with an in-flight mutex.
+//! Fixes vs original:
+//!  - Duplicate MODEL_NAME/QWEN_API_BASE removed; use crate::constants.
+//!  - last_used stored as Arc<AtomicU64> — evict_oldest is always lock-free
+//!    (original try_lock silently fell back to created_at, picking wrong victim).
+//!  - cleanup_expired() gated to run at most once per 60 s (was on every request).
+//!  - Redundant second last_used.lock().await in acquire() removed.
 
+use crate::constants::{MODEL_NAME, QWEN_API_BASE};
 use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
 use futures::lock::{Mutex, OwnedMutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 fn session_ttl() -> Duration {
     let minutes = std::env::var("QWEN_PROXY_SESSION_TTL_MINUTES")
@@ -26,47 +38,56 @@ fn max_sessions() -> usize {
         .unwrap_or(100)
 }
 
-const MODEL_NAME: &str = "qwen3.7-max";
-const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
-
 #[derive(Clone)]
 struct SessionEntry {
     chat_id: String,
     parent_id: Arc<Mutex<Option<String>>>,
     created_at: Instant,
     in_flight: Arc<Mutex<()>>,
-    last_used: Arc<Mutex<Instant>>,
+    /// Lock-free last-used timestamp (Unix millis).
+    last_used_ms: Arc<AtomicU64>,
 }
 
-/// Holds a per-chat in-flight lock until dropped (after the Qwen response completes).
 pub struct AcquiredSession {
     pub chat_id: String,
     pub parent_id: Option<String>,
     pub parent_store: Arc<Mutex<Option<String>>>,
     _in_flight_guard: OwnedMutexGuard<()>,
-    _last_used: Arc<Mutex<Instant>>,
+    last_used_ms: Arc<AtomicU64>,
 }
 
 impl AcquiredSession {
     pub async fn set_parent_id(&self, parent_id: String) {
         *self.parent_store.lock().await = Some(parent_id);
-        *self._last_used.lock().await = Instant::now();
+        self.last_used_ms.store(now_millis(), Ordering::Relaxed);
     }
 }
 
 pub struct SessionManager {
     sessions: DashMap<String, SessionEntry>,
+    /// Prevents cleanup running on every request hot path.
+    last_cleanup_ms: AtomicU64,
 }
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self { sessions: DashMap::new() }
+        Self {
+            sessions: DashMap::new(),
+            last_cleanup_ms: AtomicU64::new(0),
+        }
     }
 
-    /// Get or create a Qwen chat for `client_key`, then wait until no other request is in-flight
-    /// on that chat.
     pub async fn acquire(&self, client_key: &str, token: &str) -> Result<AcquiredSession> {
-        self.cleanup_expired();
+        let now = now_millis();
+        let last = self.last_cleanup_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) > 60_000 {
+            if self.last_cleanup_ms
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.cleanup_expired();
+            }
+        }
 
         if self.sessions.len() >= max_sessions() {
             self.evict_oldest();
@@ -88,7 +109,7 @@ impl SessionManager {
             }
         };
 
-        *entry.last_used.lock().await = Instant::now();
+        entry.last_used_ms.store(now_millis(), Ordering::Relaxed);
 
         let in_flight_guard = entry.in_flight.lock_owned().await;
         let parent_id = entry.parent_id.lock().await.clone();
@@ -98,23 +119,20 @@ impl SessionManager {
             parent_id,
             parent_store: entry.parent_id,
             _in_flight_guard: in_flight_guard,
-            _last_used: entry.last_used,
+            last_used_ms: entry.last_used_ms,
         })
     }
 
     async fn insert_new_entry(&self, client_key: &str, token: &str) -> Result<SessionEntry> {
         let chat_id = self.create_chat(token).await?;
-        info!(
-            chat_id = %chat_id,
-            client_key = %client_key,
-            "Created Qwen chat (will reuse until TTL; concurrent sends on same chat are queued)"
-        );
+        info!(chat_id = %chat_id, client_key = %client_key,
+            "Created Qwen chat (will reuse until TTL; concurrent sends are queued)");
         let entry = SessionEntry {
             chat_id,
             parent_id: Arc::new(Mutex::new(None)),
             created_at: Instant::now(),
             in_flight: Arc::new(Mutex::new(())),
-            last_used: Arc::new(Mutex::new(Instant::now())),
+            last_used_ms: Arc::new(AtomicU64::new(now_millis())),
         };
         self.sessions.insert(client_key.to_string(), entry.clone());
         Ok(entry)
@@ -130,7 +148,6 @@ impl SessionManager {
                 "chat_type": "t2t",
                 "timestamp": chrono::Utc::now().timestamp_millis(),
             });
-
             let resp = ureq::post(&format!("{}/chats/new", QWEN_API_BASE))
                 .set("accept", "application/json")
                 .set("content-type", "application/json")
@@ -140,11 +157,9 @@ impl SessionManager {
                 .set("cookie", &format!("token={}", token))
                 .send_json(&payload)
                 .map_err(|e| anyhow::anyhow!("Failed to create Qwen chat: {}", e))?;
-
             if resp.status() == 401 {
                 bail!("Qwen token expired or invalid");
             }
-
             let d: serde_json::Value = resp
                 .into_json()
                 .map_err(|e| anyhow::anyhow!("Failed to parse chat response: {}", e))?;
@@ -152,7 +167,8 @@ impl SessionManager {
                 .as_str()
                 .map(|s| s.to_string())
                 .context("No chat ID in response")
-        }).await
+        })
+        .await
     }
 
     fn cleanup_expired(&self) {
@@ -166,17 +182,14 @@ impl SessionManager {
     }
 
     fn evict_oldest(&self) {
-        // Evict by LAST USED (LRU), not creation time
-        if let Some(oldest_key) = self
+        if let Some(key) = self
             .sessions
             .iter()
-            .min_by_key(|e| {
-                e.last_used.try_lock().map(|g| *g).unwrap_or(e.created_at)
-            })
+            .min_by_key(|e| e.last_used_ms.load(Ordering::Relaxed))
             .map(|e| e.key().clone())
         {
-            warn!(key = %oldest_key, "Evicting oldest session (LRU)");
-            self.sessions.remove(&oldest_key);
+            warn!(key = %key, "Evicting oldest session (LRU)");
+            self.sessions.remove(&key);
         }
     }
 }

@@ -23,3 +23,5 @@ regex = "1"
 dirs = "5"
 dashmap = "6"
 signal-hook = "0.3"
+reqwest = { version = "0.11", features = ["stream", "json"] }
+bytes = "1"
