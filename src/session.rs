@@ -7,7 +7,6 @@
 //!  - cleanup_expired() gated to run at most once per 60 s (was on every request).
 //!  - Redundant second last_used.lock().await in acquire() removed.
 //!  - session_ttl() / max_sessions() cached with OnceLock — no env::var parse on hot path.
-//!  - Default chat shared across ephemeral sessions avoids per-request chat creation.
 
 use crate::constants::QWEN_API_BASE;
 use anyhow::{bail, Context, Result};
@@ -74,17 +73,10 @@ impl AcquiredSession {
     }
 }
 
-struct DefaultChat {
-    chat_id: String,
-    in_flight: Arc<Mutex<()>>,
-    parent_id: Arc<Mutex<Option<String>>>,
-}
-
 pub struct SessionManager {
     sessions: DashMap<String, SessionEntry>,
     /// Prevents cleanup running on every request hot path.
     last_cleanup_ms: AtomicU64,
-    default_chat: Mutex<Option<DefaultChat>>,
 }
 
 impl SessionManager {
@@ -92,32 +84,7 @@ impl SessionManager {
         Self {
             sessions: DashMap::new(),
             last_cleanup_ms: AtomicU64::new(0),
-            default_chat: Mutex::new(None),
         }
-    }
-
-    async fn ensure_default_chat(&self, token: &str) -> Result<DefaultChat> {
-        let mut guard = self.default_chat.lock().await;
-        if let Some(ref dc) = *guard {
-            return Ok(DefaultChat {
-                chat_id: dc.chat_id.clone(),
-                in_flight: dc.in_flight.clone(),
-                parent_id: dc.parent_id.clone(),
-            });
-        }
-        let chat_id = self.create_chat(token).await?;
-        let dc = DefaultChat {
-            chat_id: chat_id.clone(),
-            in_flight: Arc::new(Mutex::new(())),
-            parent_id: Arc::new(Mutex::new(None)),
-        };
-        info!(chat_id = %chat_id, "Created default Qwen chat (shared across ephemeral sessions)");
-        *guard = Some(DefaultChat {
-            chat_id,
-            in_flight: dc.in_flight.clone(),
-            parent_id: dc.parent_id.clone(),
-        });
-        Ok(dc)
     }
 
     /// Get or create a Qwen chat for `client_key`, then wait until no other request is in-flight
@@ -133,19 +100,6 @@ impl SessionManager {
             {
                 self.cleanup_expired();
             }
-        }
-
-        if client_key.starts_with("ephemeral:") || client_key.starts_with("conv:") {
-            let dc = self.ensure_default_chat(token).await?;
-            let in_flight_guard = dc.in_flight.lock_owned().await;
-            let parent_id = dc.parent_id.lock().await.clone();
-            return Ok(AcquiredSession {
-                chat_id: dc.chat_id,
-                parent_id,
-                parent_store: dc.parent_id,
-                _in_flight_guard: in_flight_guard,
-                last_used_ms: Arc::new(AtomicU64::new(now_millis())),
-            });
         }
 
         if self.sessions.len() >= max_sessions() {
