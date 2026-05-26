@@ -1036,19 +1036,17 @@ fn main() -> Result<()> {
             .await
             .expect("Failed to bind address");
 
-        let shutdown_check = async {
-            loop {
-                smol::Timer::after(Duration::from_millis(200)).await;
-                if term.load(Ordering::Relaxed) {
-                    break;
-                }
-            }
-        };
-
         loop {
             use futures::future::Either;
             let accept_fut = Box::pin(listener.accept());
-            let check_fut = Box::pin(shutdown_check);
+            let check_fut = Box::pin(async {
+                loop {
+                    smol::Timer::after(Duration::from_millis(200)).await;
+                    if term.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            });
             match futures::future::select(accept_fut, check_fut).await {
                 Either::Left((Ok((stream, peer)), _)) => {
                     let state = state.clone();
