@@ -21,7 +21,7 @@ regex = "1"
 dirs = "5"
 dashmap = "6"
 signal-hook = "0.3"
-reqwest = { version = "0.11", features = ["stream", "json"] }
+reqwest = { version = "0.11", default-features = false, features = ["stream", "json", "rustls-tls"] }
 bytes = "1"
 
 # Tokio is now the single async runtime (replaces smol + smol-hyper)
