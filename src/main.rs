@@ -442,8 +442,19 @@ fn client_session_key(v: &serde_json::Value) -> String {
             if m.get("role").and_then(|r| r.as_str()) == Some("user") {
                 let content = m
                     .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
+                    .and_then(|c| {
+                        c.as_str().map(|s| s.to_string()).or_else(|| {
+                            c.as_array().and_then(|arr| {
+                                arr.iter().find_map(|part| {
+                                    part.get("text")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| part.get("input_text").and_then(|v| v.as_str()))
+                                        .or_else(|| part.get("output_text").and_then(|v| v.as_str()))
+                                })
+                            })
+                        })
+                    })
+                    .unwrap_or_default();
                 if !content.is_empty() {
                     // fix(#2): use fnv1a_hash instead of DefaultHasher
                     return format!("conv:{:x}{}", fnv1a_hash(content), tools_suffix);
