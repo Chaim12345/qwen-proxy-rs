@@ -1,8 +1,10 @@
 mod qwen;
 mod session;
+mod streaming;
 
 use anyhow::{bail, Context, Result};
 
+use futures::StreamExt;
 use http::{Method, StatusCode};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -437,60 +439,54 @@ async fn handler(
     let prompt_tokens = estimate_tokens(&prompt);
     let model = request_model(&v);
 
-    let body_bytes: Vec<u8> = serde_json::to_vec(&payload).unwrap_or_default();
+    // Fix #12: wrap in Arc to avoid cloning the full body Vec into the spawn closure.
+    let body_arc: Arc<Vec<u8>> = Arc::new(serde_json::to_vec(&payload).unwrap_or_default());
 
     if is_stream {
         let rf = response_format.clone();
         let span = info_span!("stream", id = %completion_id, model = %model, tools = tools.len(), response_format = %rf.as_ref().map(|rf| format!("{:?}", rf.get("type"))).unwrap_or_else(|| "none".to_string()));
         async move {
-        let (tx, rx) = smol::channel::bounded::<Result<String, String>>(256);
+        // Fix #2 + #9: use QwenSseStream (truly async, no thread held) with a small
+        // backpressure buffer of 8 instead of the old 256-slot smol::channel.
+        let (tx, rx) = smol::channel::bounded::<Result<String, String>>(8);
 
         let tx2 = tx.clone();
         let headers2 = headers.clone();
         let qwen_url2 = qwen_url.clone();
-        let body2 = body_bytes.clone();
-        let rf_inner = rf.clone();
+        let body2 = Arc::clone(&body_arc);
+
+        // Fix #1 + #2: spawn truly-async SSE reader using streaming::post_sse.
+        // No thread is held for the full stream duration.
         smol::spawn(async move {
-            let result = smol::unblock(move || -> Result<(), String> {
-                let mut resp = ureq::post(&qwen_url2);
-                for (k, v) in &headers2 {
-                    resp = resp.set(k, v);
+            let mut sse = match streaming::post_sse(
+                qwen_url2,
+                headers2,
+                (*body2).clone(),
+            ).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // Fix #5: use async .send() for backpressure — never drops lines.
+                    let _ = tx2.send(Err(e)).await;
+                    drop(tx2);
+                    return;
                 }
-                let response = resp
-                    .send_bytes(&body2)
-                    .map_err(|e| format!("Qwen API error: {}", e))?;
-
-                if !(200..300).contains(&response.status()) {
-                    let status = response.status();
-                    let body_text = response.into_string().unwrap_or_default();
-                    let preview: String = body_text.chars().take(500).collect();
-                    error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
-                    if status == 429 || body_text.contains("in progress") {
-                        return Err("Qwen chat is busy (another message in flight on this chat_id)".to_string());
-                    }
-                    return Err(format!("Qwen API returned {}", status));
-                }
-
-                use std::io::{BufRead, BufReader};
-                let reader = response.into_reader();
-                for line in BufReader::new(reader).lines() {
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = tx2.try_send(Err(format!("Stream read error: {}", e)));
+            };
+            // Fix #5: async send with backpressure — replaces try_send which silently
+            // dropped lines when the consumer was slow.
+            while let Some(item) = StreamExt::next(&mut sse).await {
+                match item {
+                    Ok(line_sse) => {
+                        if tx2.send(Ok(line_sse.raw)).await.is_err() {
                             break;
                         }
-                    };
-                    if tx2.try_send(Ok(line)).is_err() {
+                    }
+                    Err(err_str) => {
+                        let _ = tx2.send(Err(err_str)).await;
                         break;
                     }
                 }
-                Ok(())
-            }).await;
-            if let Err(e) = result {
-                let _ = tx.try_send(Err(e));
             }
-            drop(tx);
+            drop(tx2);
         }).detach();
 
         let has_tools = !tools.is_empty();
@@ -500,7 +496,7 @@ async fn handler(
             move |(rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut resp_created, mut output_started, mut item_id)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
-                let rf = rf_inner.clone();
+                let rf = rf.clone();
                 let completion_id = completion_id.clone();
                 let model = model.clone();
                 async move {
@@ -509,12 +505,15 @@ async fn handler(
                     }
                     match rx.recv().await {
                         Ok(Ok(line)) => {
+                            // Track whether this chunk signals stream completion.
+                            let mut stream_finished = false;
                             if let Some(data) = parse_qwen_sse_line(&line) {
                                 if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
                                     if let Some(pid) = extract_response_parent_id(&ch) {
                                         *parent_store.lock().await = Some(pid);
                                     }
                                     if let Some(delta) = extract_qwen_sse_delta(&ch) {
+                                        stream_finished = delta.finished;
                                         full_text.append(&delta);
                                     }
                                 }
@@ -541,7 +540,9 @@ async fn handler(
                                 ));
                                 prev_thinking_len = thinking.len();
                             }
-                            if !tool_emitted && !content_emitted {
+                            // Fix #6: only run detect_tools on the finished delta to avoid
+                            // O(n²) scanning on every intermediate chunk.
+                            if !tool_emitted && !content_emitted && stream_finished {
                                 let tcs = detect_tools(full_text.full_answer(), &tools);
                                 if !tcs.is_empty() {
                                     for (i, tc) in tcs.iter().enumerate() {
@@ -812,30 +813,32 @@ async fn handler(
         Ok(response)
     }.instrument(span).await
     } else {
-        match smol::unblock(move || -> Result<String> {
-            let mut resp = ureq::post(&qwen_url);
-            for (k, v) in &headers {
-                resp = resp.set(k, v);
-            }
-            let response = resp
-                .send_bytes(&body_bytes)
-                .map_err(|e| anyhow::anyhow!("Qwen API error: {}", e))?;
-
-            if !(200..300).contains(&response.status()) {
+        // Fix #8: async reqwest instead of ureq+smol::unblock — no thread held.
+        let ns_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .unwrap_or_default();
+        let mut ns_req = ns_client.post(&qwen_url);
+        for (k, v) in &headers {
+            ns_req = ns_req.header(k.as_str(), v.as_str());
+        }
+        ns_req = ns_req.body((*body_arc).clone());
+        match ns_req.send().await {
+            Ok(response) => {
                 let status = response.status();
-                let body_text = response.into_string().unwrap_or_default();
-                let preview: String = body_text.chars().take(500).collect();
-                error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
-                if status == 429 || body_text.contains("in progress") {
-                    bail!("Qwen chat is busy (another message in flight on this chat_id)");
+                if !status.is_success() {
+                    let body_text = response.text().await.unwrap_or_default();
+                    let preview: String = body_text.chars().take(500).collect();
+                    error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
+                    if status.as_u16() == 429 || body_text.contains("in progress") {
+                        return Ok(internal_error("Qwen chat is busy (another message in flight on this chat_id)").map(|b| box_body(b)));
+                    }
+                    return Ok(internal_error(format!("Qwen API returned {}", status)).map(|b| box_body(b)));
                 }
-                bail!("Qwen API returned {}", status);
-            }
-
-            let body_text = response.into_string().map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
-            Ok(body_text)
-        }).await {
-            Ok(body_text) => {
+                let body_text = match response.text().await {
+                    Ok(t) => t,
+                    Err(e) => return Ok(internal_error(format!("Failed to read response: {}", e)).map(|b| box_body(b))),
+                };
                 let mut acc = AccumulatedText::new();
                 for line in body_text.lines() {
                     if let Some(data) = parse_qwen_sse_line(line) {
