@@ -27,6 +27,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 struct AppState {
     sessions: SessionManager,
     token: String,
+    http: reqwest::Client,
 }
 
 fn load_token() -> Result<String> {
@@ -127,6 +128,7 @@ fn not_found_response() -> Response<Full<Bytes>> {
 
 const MODELS_JSON: &str = r#"{"object":"list","data":[
 {"id":"qwen3.7-max","object":"model","created":1700000000,"owned_by":"qwen","permission":[],"root":"qwen3.7-max","parent":null},
+{"id":"qwen3.7-max-preview","object":"model","created":1700000000,"owned_by":"qwen","permission":[],"root":"qwen3.7-max-preview","parent":null},
 {"id":"qwen3.6-plus","object":"model","created":1700000000,"owned_by":"qwen","permission":[],"root":"qwen3.6-plus","parent":null},
 {"id":"qwen3.6-max-preview","object":"model","created":1700000000,"owned_by":"qwen","permission":[],"root":"qwen3.6-max-preview","parent":null}
 ]}"#;
@@ -146,19 +148,15 @@ fn models_handler() -> Response<Full<Bytes>> {
 
 fn model_handler(model_id: &str) -> Response<Full<Bytes>> {
     if model_id == MODEL_NAME
+        || model_id == "qwen3.7-max-preview"
         || model_id == "qwen3.6-plus"
         || model_id == "qwen3.6-max-preview"
         || model_id == "gpt-4"
         || model_id == "gpt-4o"
         || model_id == "gpt-3.5-turbo"
     {
-        let resolved_id = if model_id == "gpt-4" || model_id == "gpt-4o" || model_id == "gpt-3.5-turbo"
-        {
-            MODEL_NAME
-        } else {
-            model_id
-        };
-        json_response(StatusCode::OK, &model_info(resolved_id))
+        let resolved_id = crate::constants::qwen_upstream_model(Some(model_id));
+        json_response(StatusCode::OK, &model_info(&resolved_id))
     } else {
         openai_error_response(
             StatusCode::NOT_FOUND,
@@ -182,11 +180,24 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 fn request_model(v: &serde_json::Value) -> String {
-    v.get("model")
-        .and_then(|m| m.as_str())
-        .filter(|m| !m.is_empty())
-        .unwrap_or(MODEL_NAME)
-        .to_string()
+    crate::constants::qwen_upstream_model(
+        v.get("model")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty()),
+    )
+}
+
+/// OpenAI-compatible clients (Cursor, OpenCode, DeepSeek-compat) read `reasoning_content`
+/// in the delta — not a custom `thinking` field.
+fn build_reasoning_delta(text: &str, first: bool) -> serde_json::Value {
+    let mut delta = serde_json::json!({
+        "reasoning_content": text,
+        "thinking": text,
+    });
+    if first {
+        delta["role"] = serde_json::json!("assistant");
+    }
+    delta
 }
 
 fn build_stream_chunk(
@@ -307,6 +318,75 @@ fn build_qwen_tool_error_feedback(err_msg: &str) -> String {
         "TOOL RESULT: ERROR: Qwen reported tool error: {}. Only use exact names from the list the client provided. Retry with a valid tool or respond in plain text without a tool call.",
         err_msg
     )
+}
+
+/// Run validate_tool_calls; on synthetic-ok feedback, spawn best-effort Qwen continuation.
+fn tool_gate_stream(
+    raw: Vec<ToolCall>,
+    tools: &[serde_json::Value],
+    chat_id: &str,
+    parent_id: Option<String>,
+    token: &str,
+) -> Result<Vec<ToolCall>, Vec<String>> {
+    match validate_tool_calls(raw, tools) {
+        ToolGateResult::Emit {
+            emit,
+            synthetic_feedback,
+        } => {
+            for fb in synthetic_feedback {
+                spawn_feedback_if_hallucinated(
+                    chat_id.to_string(),
+                    parent_id.clone(),
+                    fb,
+                    token.to_string(),
+                );
+            }
+            Ok(emit)
+        }
+        ToolGateResult::Blocked(bad) => Err(bad),
+    }
+}
+
+/// Non-stream / raw-body: await synthetic-ok feedback injection when enabled.
+async fn tool_gate_nonstream(
+    raw: Vec<ToolCall>,
+    tools: &[serde_json::Value],
+    session_id: &str,
+    latest_pid: Option<&str>,
+    token: &str,
+    session: &session::AcquiredSession,
+) -> Result<Vec<ToolCall>, Vec<String>> {
+    match validate_tool_calls(raw, tools) {
+        ToolGateResult::Emit {
+            emit,
+            synthetic_feedback,
+        } => {
+            for fb in synthetic_feedback {
+                if let Some(pid) = latest_pid {
+                    match send_qwen_chat_continuation(session_id, Some(pid), &fb, token).await {
+                        Ok(Some(new_pid)) => {
+                            session.set_parent_id(new_pid.clone()).await;
+                            info!(
+                                chat_id = %session_id,
+                                new_parent = %new_pid,
+                                "TOOL_SYNTHETIC_OK: fake successful tool result injected into Qwen chat"
+                            );
+                        }
+                        Ok(None) => {
+                            warn!(chat_id = %session_id, "TOOL_SYNTHETIC_OK: no new parent_id returned");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, chat_id = %session_id, "TOOL_SYNTHETIC_OK: feedback send failed");
+                        }
+                    }
+                } else {
+                    warn!(chat_id = %session_id, "TOOL_SYNTHETIC_OK: no parent_id; skipping injection");
+                }
+            }
+            Ok(emit)
+        }
+        ToolGateResult::Blocked(bad) => Err(bad),
+    }
 }
 
 /// fix(#2): stable FNV-1a hasher — deterministic across process restarts,
@@ -483,7 +563,10 @@ async fn handler(
         )
     };
 
-    let payload = qwen_payload(&session_id, parent_id.as_deref(), &prompt);
+    let upstream_model = crate::constants::qwen_upstream_model(
+        v.get("model").and_then(|m| m.as_str()).filter(|m| !m.is_empty()),
+    );
+    let payload = qwen_payload(&session_id, parent_id.as_deref(), &prompt, &upstream_model);
 
     let qwen_url = format!("{}/chat/completions?chat_id={}", QWEN_API_BASE, session_id);
     let headers = qwen_request_headers(&st.token);
@@ -501,16 +584,18 @@ async fn handler(
         let span = info_span!("stream", id = %completion_id, model = %model, tools = tools.len(), response_format = %rf.as_ref().map(|rf| format!("{:?}", rf.get("type"))).unwrap_or_else(|| "none".to_string()));
         async move {
         // Tokio mpsc replaces previous smol::channel for backpressure (8 line buffer)
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(64);
 
         let tx2 = tx.clone();
         let headers2 = headers.clone();
         let qwen_url2 = qwen_url.clone();
         let body2 = Arc::clone(&body_arc);
+        let http = st.http.clone();
 
-        // Spawn the upstream SSE reader (now under Tokio)
+        // Spawn the upstream SSE reader — true reqwest streaming (incremental TTFB)
         tokio::spawn(async move {
             let mut sse = match streaming::post_sse(
+                http,
                 qwen_url2,
                 headers2,
                 (*body2).clone(),
@@ -543,8 +628,8 @@ async fn handler(
         let chat_id_for_fb = session_id.clone();
         let token_for_fb = st.token.clone();
         let sse_stream = futures::stream::unfold(
-            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize, false, false, String::new()),
-            move |(mut rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut resp_created, mut output_started, mut item_id)| {
+            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize, false, false, false, String::new()),
+            move |(mut rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut thinking_role_sent, mut resp_created, mut output_started, mut item_id)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let rf = rf.clone();
@@ -587,11 +672,13 @@ async fn handler(
                             let thinking = full_text.thinking();
                             if thinking.len() > prev_thinking_len {
                                 let delta = &thinking[prev_thinking_len..];
+                                let first_thinking = !thinking_role_sent;
                                 oai_chunks.push(build_stream_chunk(
                                     &completion_id, &model, created,
-                                    serde_json::json!({"thinking": delta}),
+                                    build_reasoning_delta(delta, first_thinking),
                                     None,
                                 ));
+                                thinking_role_sent = true;
                                 prev_thinking_len = thinking.len();
                             }
                             // Fix #6: only run detect_tools on the finished delta to avoid
@@ -601,7 +688,14 @@ async fn handler(
                             // emission. No extra end-of-stream buffering required for name validation (tool JSON is atomic).
                             if !tool_emitted && !content_emitted && stream_finished {
                                 let raw_tcs = detect_tools(full_text.full_answer(), &tools);
-                                let tcs = match validate_tool_calls(raw_tcs, &tools) {
+                                let pid_for_gate = parent_store.lock().await.clone();
+                                let tcs = match tool_gate_stream(
+                                    raw_tcs,
+                                    &tools,
+                                    &chat_id_for_fb,
+                                    pid_for_gate,
+                                    &token_for_fb,
+                                ) {
                                     Ok(good) => good,
                                     Err(bad_names) => {
                                         error!(
@@ -628,7 +722,7 @@ async fn handler(
                                         spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
                                         info!(chat_id = %chat_id_for_fb, hallucinated = ?bad_names, "Phase 3 feedback spawned async (mid-stream)");
                                         let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
                                     }
                                 };
                                 if !tcs.is_empty() {
@@ -671,7 +765,7 @@ async fn handler(
                                         }
                                     }
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
                                 }
                                 let answer = full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
@@ -732,9 +826,9 @@ async fn handler(
                             }
                             if !oai_chunks.is_empty() {
                                 let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
+                                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
                             }
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)))
                         }
                         Some(Err(err_str)) => {
                             let err_chunk = format!(
@@ -744,7 +838,7 @@ async fn handler(
                                     Some("stop"),
                                 )
                             );
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)))
                         }
                         None => {   // all senders dropped (normal end or error path)
                             let mut final_chunks = String::new();
@@ -772,13 +866,20 @@ async fn handler(
                                         let fb = build_qwen_tool_error_feedback(&err_msg);
                                         spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
                                         info!(chat_id = %chat_id_for_fb, error = %err_msg, "Phase 3 feedback spawned async (stream detect_qwen err)");
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
                                     }
                                 }
                                 // Phase 4: full_text accumulation + terminal-only detect already provides complete payload
                                 // for validate before emission. No extra buffering required (see mid-stream comment).
                                 let raw_tcs = detect_tools(&answer, &tools);
-                                let tcs = match validate_tool_calls(raw_tcs, &tools) {
+                                let pid_for_gate = parent_store.lock().await.clone();
+                                let tcs = match tool_gate_stream(
+                                    raw_tcs,
+                                    &tools,
+                                    &chat_id_for_fb,
+                                    pid_for_gate,
+                                    &token_for_fb,
+                                ) {
                                     Ok(good) => good,
                                     Err(bad_names) => {
                                         error!(
@@ -806,7 +907,7 @@ async fn handler(
                                         let fb = build_tool_hallucination_feedback(&bad_names);
                                         spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
                                         info!(chat_id = %chat_id_for_fb, hallucinated = ?bad_names, "Phase 3 feedback spawned async (stream-end)");
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
                                     }
                                 };
                                 if !tcs.is_empty() {
@@ -927,7 +1028,7 @@ async fn handler(
                                 }
                             }
                             final_chunks.push_str("data: [DONE]\n\n");
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)))
                         }
                     }
                 }
@@ -1018,7 +1119,16 @@ async fn handler(
                     // Phase 4.1 / 3.4: close the raw-body bypass (was detect + direct emit with zero validate).
                     // Now uniform hard gate + feedback like the other 3 emission sites. Unknown names *never* leak.
                     let raw_tcs = detect_tools(&body_text, &tools);
-                    let tcs = match validate_tool_calls(raw_tcs, &tools) {
+                    let tcs = match tool_gate_nonstream(
+                        raw_tcs,
+                        &tools,
+                        &session_id,
+                        latest_pid.as_deref(),
+                        &st.token,
+                        &session,
+                    )
+                    .await
+                    {
                         Ok(good) => good,
                         Err(bad_names) => {
                             error!(
@@ -1134,7 +1244,16 @@ async fn handler(
                 }
 
                 let raw_tcs = detect_tools(&full_text, &tools);
-                let tcs = match validate_tool_calls(raw_tcs, &tools) {
+                let tcs = match tool_gate_nonstream(
+                    raw_tcs,
+                    &tools,
+                    &session_id,
+                    latest_pid.as_deref(),
+                    &st.token,
+                    &session,
+                )
+                .await
+                {
                     Ok(good) => good,
                     Err(bad_names) => {
                         error!(
@@ -1417,9 +1536,12 @@ fn main() -> Result<()> {
 
     let token = load_token()?;
 
+    let http = streaming::build_http_client()
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
     let state = Arc::new(AppState {
         sessions: SessionManager::new(),
         token,
+        http,
     });
 
     // fix(#5): read PORT once at startup rather than on every request.

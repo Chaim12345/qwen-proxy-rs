@@ -1,17 +1,15 @@
-//! Async SSE streaming using reqwest (async) instead of ureq (blocking).
-//!
-//! Fixes vs original streaming.rs:
-//!  - Uses VecDeque to buffer lines; no intermediate Vec + push-front reversal.
-//!  - poll_next yields one line per call instead of only the first of a batch.
-//!  - post_sse() exposed so main.rs can call it directly (was never imported before).
-//!  - request_id is Arc<str> — clone per SSE line is a refcount bump, not a heap alloc.
+//! True async SSE streaming via a shared reqwest client (connection reuse + incremental TTFB).
+//! Avoids the old blocking ureq path that called `into_string()` and buffered the entire
+//! upstream response before the client saw the first byte.
 
 use bytes::Bytes;
 use futures::Stream;
+use reqwest::Client;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tracing::{debug, error, trace};
 
 #[allow(dead_code)]
@@ -29,21 +27,20 @@ pub struct QwenSseStream {
 }
 
 impl QwenSseStream {
-    /// Create a pre-filled stream from already-fetched lines (used for the blocking ureq path in post_sse).
-    /// (The reqwest-based `new` ctor was removed as unused after the Tokio refactor.)
-    pub fn from_lines(request_id: impl Into<Arc<str>>, lines: Vec<String>) -> Self {
-        let request_id = request_id.into();
-        debug!(request_id = %request_id, line_count = lines.len(), "Qwen SSE stream (preloaded from blocking)");
-        let mut ready = VecDeque::new();
-        for l in lines {
-            ready.push_back(l);
-        }
+    pub fn new(resp: reqwest::Response) -> Self {
+        let request_id: Arc<str> = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .into();
+        debug!(status = %resp.status(), request_id = %request_id, "Qwen SSE stream opened (reqwest)");
         Self {
-            inner: Box::pin(futures::stream::pending()), // not used
+            inner: Box::pin(resp.bytes_stream()),
             buf: String::new(),
-            ready,
+            ready: VecDeque::new(),
             request_id,
-            finished: true,
+            finished: false,
         }
     }
 
@@ -51,7 +48,9 @@ impl QwenSseStream {
         while let Some(pos) = self.buf.find('\n') {
             let line: String = self.buf.drain(..=pos).collect();
             let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
-            self.ready.push_back(line);
+            if !line.is_empty() {
+                self.ready.push_back(line);
+            }
         }
     }
 }
@@ -79,7 +78,9 @@ impl Stream for QwenSseStream {
             }
             match self.inner.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => { self.finished = true; }
+                Poll::Ready(None) => {
+                    self.finished = true;
+                }
                 Poll::Ready(Some(Err(e))) => {
                     error!(error = %e, "Qwen SSE bytes_stream error");
                     return Poll::Ready(Some(Err(format!("Upstream stream error: {}", e))));
@@ -94,40 +95,39 @@ impl Stream for QwenSseStream {
     }
 }
 
+pub fn build_http_client() -> Result<Client, String> {
+    Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(30))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("Failed to build reqwest client: {}", e))
+}
+
+/// Stream SSE lines from Qwen as they arrive (real streaming, not buffer-then-play).
 pub async fn post_sse(
+    client: Client,
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 ) -> Result<QwenSseStream, String> {
-    // Blocking ureq fetch now via tokio::task::spawn_blocking (safe under the Tokio runtime)
-    let body2 = body.clone();
-    let url2 = url.clone();
-    let headers2 = headers.clone();
-    let res: Result<(u16, String, String), String> = tokio::task::spawn_blocking(move || {
-        let mut req = ureq::post(&url2);
-        for (k, v) in &headers2 {
-            req = req.set(k.as_str(), v.as_str());
-        }
-        req = req.set("accept", "text/event-stream");
-        match req.send_bytes(&body2) {
-            Ok(resp) => {
-                let status = resp.status();
-                let req_id = resp.header("x-request-id").unwrap_or("").to_string();
-                let body_text = resp.into_string().unwrap_or_default();
-                Ok((status, req_id, body_text))
-            }
-            Err(e) => Err(format!("Qwen SSE request failed: {}", e)),
-        }
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking join error: {}", e))?;
+    let mut req = client
+        .post(&url)
+        .header("accept", "text/event-stream")
+        .body(body);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
 
-    let (status, request_id, body_text) = match res {
-        Ok(t) => t,
-        Err(e) => return Err(e),
-    };
-    if !(200..300).contains(&status) {
-        if status == 429 || body_text.contains("in progress") {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Qwen SSE request failed: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 429 || body_text.contains("in progress") {
             return Err("Qwen chat is busy (another message in flight)".to_string());
         }
         return Err(format!(
@@ -136,7 +136,6 @@ pub async fn post_sse(
             body_text.chars().take(200).collect::<String>()
         ));
     }
-    // Preload all lines so the returned stream yields them without hitting the (unused) inner reqwest stream.
-    let lines: Vec<String> = body_text.lines().map(|s| s.to_string()).collect();
-    Ok(QwenSseStream::from_lines(request_id, lines))
+
+    Ok(QwenSseStream::new(resp))
 }

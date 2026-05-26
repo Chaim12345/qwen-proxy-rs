@@ -11,6 +11,15 @@
  * - npm install ai @ai-sdk/openai zod
  *
  * Run: node qwen-proxy-rs/tests/toolcall_stress_test.mjs
+ *
+ * Phase 5.3 (Robust Tool Translator): for "0 unknown tool names ever emitted" guarantee,
+ * after any generateText/streamText with tools, add client-side assert:
+ *   const allowed = Object.keys(tools);
+ *   const bad = (toolCalls||[]).filter(tc => !allowed.includes(tc.toolName));
+ *   assert(bad.length===0, "unknown tool names leaked: "+bad.map(b=>b.toolName));
+ *   or on error shape, assert no bad names in any event.
+ * This .mjs is harness-dependent (live proxy + QWEN_TOKEN + `npm install ai @ai-sdk/openai zod` + net).
+ * Run manually when available; do not make CI-flaky. See also ai_sdk_test.mjs + contract_checklist_test.mjs.
  */
 
 import { generateText, streamText, tool } from "ai";

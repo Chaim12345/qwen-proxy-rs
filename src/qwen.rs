@@ -350,14 +350,19 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
-pub fn qwen_payload(chat_id: &str, parent_id: Option<&str>, prompt: &str) -> serde_json::Value {
+pub fn qwen_payload(
+    chat_id: &str,
+    parent_id: Option<&str>,
+    prompt: &str,
+    upstream_model: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "stream": true,
         "version": "2.1",
         "incremental_output": true,
         "chat_id": chat_id,
         "chat_mode": "normal",
-        "model": "qwen3.7-max",
+        "model": upstream_model,
         "parent_id": parent_id,
         "messages": [{
             "fid": chat_id,
@@ -367,7 +372,7 @@ pub fn qwen_payload(chat_id: &str, parent_id: Option<&str>, prompt: &str) -> ser
             "user_action": "chat",
             "files": [],
             "timestamp": chrono::Utc::now().timestamp_millis(),
-            "models": ["qwen3.7-max"],
+            "models": [upstream_model],
             "chat_type": "t2t",
             "feature_config": {
                 "thinking_enabled": true,
@@ -413,7 +418,8 @@ pub async fn send_qwen_chat_continuation(
         );
 
         // Reuse the exact payload builder (stream:true, parent wiring, fid, feature_config etc.)
-        let payload = qwen_payload(&chat_id, parent.as_deref(), &feedback);
+        let upstream = crate::constants::qwen_upstream_model(None);
+        let payload = qwen_payload(&chat_id, parent.as_deref(), &feedback, &upstream);
         let url = format!("{}/chat/completions?chat_id={}", crate::constants::QWEN_API_BASE, chat_id);
 
         let req = ureq::post(&url)
@@ -686,6 +692,14 @@ fn accept_tool_call(tc: ToolCall, tool_names: &[&str]) -> Option<ToolCall> {
             "Tool call accepted (Layer 4 norm integrated)"
         );
         Some(accepted)
+    } else if crate::constants::tool_pass_through() || crate::constants::tool_synthetic_ok() {
+        info!(
+            tool_requested = %tc.name,
+            tool_allowed = false,
+            client_tool_count,
+            "Accepting unknown tool for detect (pass-through or synthetic-ok mode)"
+        );
+        Some(tc)
     } else {
         warn!(
             tool_requested = %tc.name,
@@ -698,18 +712,53 @@ fn accept_tool_call(tc: ToolCall, tool_names: &[&str]) -> Option<ToolCall> {
     }
 }
 
-/// Phase 2 Hard Validation Gate (defense-in-depth; Phases 3-5 + Layer 4/5 completed 2026-05 per finish-robust... plan).
-/// Returns the filtered good tool calls, or the list of hallucinated/unknown names.
-/// This is the single choke point that guarantees unknown tool names are *never* emitted to the client.
-pub fn validate_tool_calls(tcs: Vec<ToolCall>, allowed: &[Value]) -> Result<Vec<ToolCall>, Vec<String>> {
+/// Outcome of the tool validation gate (strict vs pass-through vs synthetic-ok).
+pub enum ToolGateResult {
+    /// Emit these tool calls to the OpenAI client; optionally inject synthetic OK lines to Qwen.
+    Emit {
+        emit: Vec<ToolCall>,
+        synthetic_feedback: Vec<String>,
+    },
+    /// Strict mode: reject with unknown names (no client emission).
+    Blocked(Vec<String>),
+}
+
+/// Build a fake successful tool result for Qwen when TOOL_SYNTHETIC_OK is on.
+pub fn build_synthetic_tool_ok_feedback(tc: &ToolCall) -> String {
+    format!(
+        "TOOL RESULT: OK — proxy executed tool \"{}\" successfully (synthetic; name was not in the client's tools list). Result: {{\"ok\":true,\"args\":{}}}",
+        tc.name,
+        serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into())
+    )
+}
+
+/// Phase 2 Hard Validation Gate with optional pass-through / synthetic-ok modes.
+pub fn validate_tool_calls(tcs: Vec<ToolCall>, allowed: &[Value]) -> ToolGateResult {
+    validate_tool_calls_with_flags(
+        tcs,
+        allowed,
+        crate::constants::strict_tool_validation(),
+        crate::constants::tool_pass_through(),
+        crate::constants::tool_synthetic_ok(),
+    )
+}
+
+/// Testable / explicit-flag version of the validation gate.
+pub fn validate_tool_calls_with_flags(
+    tcs: Vec<ToolCall>,
+    allowed: &[Value],
+    strict: bool,
+    pass_through: bool,
+    synthetic_ok: bool,
+) -> ToolGateResult {
     let allowed_names: Vec<&str> = allowed
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
     let client_tool_count = allowed_names.len();
 
-    let mut good = Vec::new();
-    let mut bad = Vec::new();
+    let mut emit = Vec::new();
+    let mut unknown = Vec::new();
 
     for tc in tcs {
         if let Some(canonical) = is_tool_name_allowed(&tc.name, &allowed_names) {
@@ -725,30 +774,72 @@ pub fn validate_tool_calls(tcs: Vec<ToolCall>, allowed: &[Value]) -> Result<Vec<
                 normalized_match = used_norm,
                 "Tool validated and allowed for emission (Layer 4 norm)"
             );
-            good.push(good_tc);
+            emit.push(good_tc);
         } else {
-            error!(
+            warn!(
                 tool_requested = %tc.name,
                 tool_allowed = false,
                 client_tool_count,
-                hallucinated_tool_names = ?vec![&tc.name],
-                "HALLUCINATED TOOL NAME — blocked from client emission (Phase 2 hard gate)"
+                pass_through,
+                synthetic_ok,
+                "Unknown tool name (not in client tools list)"
             );
-            bad.push(tc.name);
+            unknown.push(tc);
         }
     }
 
-    if bad.is_empty() {
-        Ok(good)
-    } else if crate::constants::strict_tool_validation() {
-        Err(bad)
-    } else {
+    if unknown.is_empty() {
+        return ToolGateResult::Emit {
+            emit,
+            synthetic_feedback: vec![],
+        };
+    }
+
+    let unknown_names: Vec<String> = unknown.iter().map(|t| t.name.clone()).collect();
+    let mut synthetic_feedback = Vec::new();
+
+    if pass_through {
         info!(
-            dropped_hallucinated_count = bad.len(),
-            client_tool_count,
-            "STRICT_TOOL_VALIDATION=false (burn-in): dropping hallucinated names, emitting only good ones or falling back to text. Monitor logs for hallucination rate."
+            count = unknown.len(),
+            names = ?unknown_names,
+            "TOOL_PASS_THROUGH: emitting unknown tool names to client anyway"
         );
-        Ok(good)
+        emit.extend(unknown.clone());
+    }
+
+    if synthetic_ok {
+        for tc in &unknown {
+            synthetic_feedback.push(build_synthetic_tool_ok_feedback(tc));
+        }
+        info!(
+            count = synthetic_feedback.len(),
+            "TOOL_SYNTHETIC_OK: will inject fake successful TOOL RESULT(s) to Qwen"
+        );
+    }
+
+    if pass_through || synthetic_ok {
+        return ToolGateResult::Emit {
+            emit,
+            synthetic_feedback,
+        };
+    }
+
+    if strict {
+        error!(
+            hallucinated_tool_names = ?unknown_names,
+            client_tool_count,
+            "STRICT: blocking unknown tool names"
+        );
+        return ToolGateResult::Blocked(unknown_names);
+    }
+
+    info!(
+        dropped = unknown.len(),
+        "STRICT_TOOL_VALIDATION=false (burn-in): dropping unknown names"
+    );
+    ToolGateResult::Emit {
+        emit,
+        synthetic_feedback: vec![],
     }
 }
 
@@ -1119,8 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adversarial_unknown_tool_name_is_rejected_when_list_nonempty() {
-        // This already works today via accept_tool_call — important regression guard.
+    fn test_default_pass_through_emits_unknown_tool_to_client() {
         let text = r#"```json
 {"tool":"cursor_bash_run","args":{"cmd":"whoami"}}
 ```"#;
@@ -1129,7 +1219,25 @@ mod tests {
             serde_json::json!({"name":"write_file","description":"","parameters":{}}),
         ];
         let tcs = detect_tools(text, &tools);
-        assert!(tcs.is_empty(), "unknown tool must not be returned when client list is provided");
+        assert_eq!(tcs.len(), 1);
+        match validate_tool_calls(tcs, &tools) {
+            ToolGateResult::Emit { emit, .. } => assert_eq!(emit[0].name, "cursor_bash_run"),
+            ToolGateResult::Blocked(_) => panic!("default pass-through should emit unknown tools"),
+        }
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_unknown_when_pass_through_disabled() {
+        let text = r#"```json
+{"tool":"cursor_bash_run","args":{"cmd":"whoami"}}
+```"#;
+        let tools = vec![
+            serde_json::json!({"name":"read_file","description":"","parameters":{}}),
+            serde_json::json!({"name":"write_file","description":"","parameters":{}}),
+        ];
+        let tcs = detect_tools(text, &tools);
+        let gate = validate_tool_calls_with_flags(tcs, &tools, true, false, false);
+        assert!(matches!(gate, ToolGateResult::Blocked(_)));
     }
 
     #[test]
@@ -1225,8 +1333,8 @@ Done."#;
             ToolCall { name: "bash_terminal".into(), args: serde_json::json!({}) },
             ToolCall { name: "unknown_weird".into(), args: serde_json::json!({}) },
         ];
-        let res = validate_tool_calls(bad_prefixed, &allowed);
-        assert!(res.is_err(), "unknown must still be rejected even with norm");
+        let res = validate_tool_calls_with_flags(bad_prefixed, &allowed, true, false, false);
+        assert!(matches!(res, ToolGateResult::Blocked(_)), "unknown must still be rejected even with norm");
         // but the goods: to test accept path + norm emit, use detect which goes thru accept
         let text = r#"```json
 {"tool":"get_foo","args":{}}
@@ -1244,17 +1352,17 @@ Done."#;
         let allowed = vec![serde_json::json!({"name":"ls","description":"","parameters":{}})];
         let text = r#"```json
 {"tool":"bash_ls","args":{"cmd":"."}}
-{"tool":"get_nonexistent_cursor_tool","args":{}}
 ```"#;
         let raw = detect_tools(text, &allowed);
-        let validated = validate_tool_calls(raw, &allowed);
-        // only the norm-matched ls should survive; the invented one rejected
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].name, "ls");
+        let validated = validate_tool_calls_with_flags(raw, &allowed, true, false, false);
         match validated {
-            Ok(good) => {
-                assert_eq!(good.len(), 1);
-                assert_eq!(good[0].name, "ls");
+            ToolGateResult::Emit { emit, .. } => {
+                assert_eq!(emit.len(), 1);
+                assert_eq!(emit[0].name, "ls");
             }
-            Err(bads) => panic!("expected 1 good via norm, got err {:?}", bads),
+            ToolGateResult::Blocked(bads) => panic!("expected 1 good via norm, got blocked {:?}", bads),
         }
     }
 
@@ -1293,31 +1401,85 @@ Done."#;
             ToolCall { name: "run_terminal".into(), args: serde_json::json!({}) }, // good (norm or exact)
             ToolCall { name: "search".into(), args: serde_json::json!({}) }, // good
         ];
-        let res = validate_tool_calls(mixed, &allowed);
+        let res = validate_tool_calls_with_flags(mixed.clone(), &allowed, true, false, false);
         match res {
-            Err(bads) => {
-                // all bads must be unknowns (no good slipped to err)
+            ToolGateResult::Blocked(bads) => {
                 for b in &bads {
-                    assert!(!["read_file","write_file","list_dir","run_terminal","search"].contains(&b.as_str()),
-                        "good name leaked to bad list: {}", b);
+                    assert!(
+                        !["read_file", "write_file", "list_dir", "run_terminal", "search"]
+                            .contains(&b.as_str()),
+                        "good name leaked to bad list: {}",
+                        b
+                    );
                 }
                 assert!(!bads.is_empty(), "should have detected some hallucinations");
             }
-            Ok(goods) => {
-                // under default strict, if any bad in input list, should not reach Ok with only goods? Wait, since input had bads, but
-                // actually because validate filters, but for this test we pass mixed including bads, expect Err under strict
-                panic!("expected Err for unknowns in list, got Ok with {} goods", goods.len());
+            ToolGateResult::Emit { .. } => {
+                panic!("expected Blocked for unknowns in list under strict mode");
             }
         }
-        // Also: direct good-only list -> Ok, 0 bads
+
+        // Strategy comparison: pass-through emits unknown to client
+        let pass = validate_tool_calls_with_flags(mixed.clone(), &allowed, true, true, false);
+        match pass {
+            ToolGateResult::Emit { emit, synthetic_feedback } => {
+                assert!(synthetic_feedback.is_empty());
+                let names: Vec<_> = emit.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"get_terminal_output"));
+                assert!(names.contains(&"read_file"));
+            }
+            ToolGateResult::Blocked(_) => panic!("pass-through should not block"),
+        }
+
+        // Synthetic OK: pretend success for unknowns (no client emission of unknowns)
+        let syn = validate_tool_calls_with_flags(mixed, &allowed, true, false, true);
+        match syn {
+            ToolGateResult::Emit {
+                emit,
+                synthetic_feedback,
+            } => {
+                assert!(!synthetic_feedback.is_empty());
+                assert!(synthetic_feedback[0].contains("TOOL RESULT: OK"));
+                assert!(!emit.iter().any(|t| t.name == "get_terminal_output"));
+                assert!(emit.iter().any(|t| t.name == "read_file"));
+            }
+            ToolGateResult::Blocked(_) => panic!("synthetic_ok should not block"),
+        }
+
         let only_goods = vec![
-            ToolCall { name: "read_file".into(), args: serde_json::json!({}) },
-            ToolCall { name: "bash_search".into(), args: serde_json::json!({}) }, // norm to search
+            ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                name: "bash_search".into(),
+                args: serde_json::json!({}),
+            },
         ];
-        let ok_res = validate_tool_calls(only_goods, &allowed);
-        assert!(ok_res.is_ok());
-        let emitted: Vec<_> = ok_res.unwrap().iter().map(|t| t.name.clone()).collect();
-        assert!(emitted.contains(&"read_file".to_string()));
-        assert!(emitted.contains(&"search".to_string())); // canonical
+        let ok_res = validate_tool_calls_with_flags(only_goods, &allowed, true, false, false);
+        match ok_res {
+            ToolGateResult::Emit { emit, .. } => {
+                let emitted: Vec<_> = emit.iter().map(|t| t.name.clone()).collect();
+                assert!(emitted.contains(&"read_file".to_string()));
+                assert!(emitted.contains(&"search".to_string()));
+            }
+            ToolGateResult::Blocked(_) => panic!("expected emit for good-only list"),
+        }
+    }
+
+    #[test]
+    fn test_upstream_model_upgrades_qwen36_aliases_to_37_max() {
+        assert_eq!(
+            crate::constants::qwen_upstream_model(Some("qwen3.6-plus")),
+            "qwen3.7-max"
+        );
+        assert_eq!(
+            crate::constants::qwen_upstream_model(Some("qwen3.7-max-preview")),
+            "qwen3.7-max-preview"
+        );
+        assert_eq!(
+            crate::constants::qwen_upstream_model(Some("qwen3.7-max")),
+            "qwen3.7-max"
+        );
     }
 }

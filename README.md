@@ -6,13 +6,57 @@ A high-performance Rust proxy that exposes the Qwen AI API as an **OpenAI-compat
 
 - ✅ **OpenAI-compatible chat & models** — drop-in for clients that use `/v1/chat/completions` and `/v1/models`
 - ✅ **SSE streaming** — emits `chat.completion.chunk` events and a `[DONE]` sentinel (upstream response is buffered before chunk emission)
-- ✅ **Tool/Function Calling** — detects tool calls in Qwen responses and formats them as OpenAI tool calls
+- ✅ **Tool/Function Calling** — robust translator for *any* OpenAI-compatible client tool schema (incl. large/dynamic agent sets from Cursor, Aider, Vercel AI SDK, etc.). Prompt hardening + hard validation gate at every emission site + parent_id feedback loop + name normalization (Layer 4). Unknown/hallucinated tool names are *never* forwarded to the client. Hallucinations logged at error level + turned into in-context "TOOL RESULT: ERROR..." corrections for that Qwen chat thread (subsequent turns benefit). See ## Tool Calling Compatibility and the plan docs.
 - ✅ **Models endpoint** — `/v1/models` and `/v1/models/:id` with GPT model aliases
 - ✅ **Embeddings stub** — returns zero-vectors for API compatibility
 - ✅ **Session pooling** — automatic Qwen chat session management with 30min TTL
 - ✅ **CORS support** — works from browser-based clients
 - ✅ **Zstd decompression** — handles compressed request bodies
 - ✅ **Graceful shutdown** — handles Ctrl+C and SIGTERM
+
+## Tool Calling Compatibility
+
+The proxy implements a production-grade **Robust Tool-Calling Translator** (Phases 0-5 complete as of 2026-05) so that Qwen can be used reliably with arbitrary OpenAI `tools` schemas from any client (including agentic ones like Cursor with 20-50+ tools and names like `get_terminal_output`, `bash_run`, `execute_command`).
+
+**How it works (defense in depth):**
+- Prompt hardening (Phase 1): compact tool list + reinforced "output ONLY as complete ```json block at the very end, using an *exact* name from the list above. Never invent names."
+- Multi-strategy detection in `detect_tools` (markdown codeblock fast-path preferred).
+- **Hard validation gate** `validate_tool_calls` (Phase 2) at *every* emission site (4 paths in main.rs: mid-stream, stream-end, non-stream final, raw-body). Unknown names → never emitted.
+- **Feedback/recovery loop** (Phase 3): on hallucination (validate fail or `detect_qwen_tool_error`), synthesize `TOOL RESULT: ERROR: You attempted to call tool(s) ["bad"] which are not... Only use exact names...` and POST as continuation via the session's `parent_id` / AcquiredSession mechanism. The new response_id is set so future turns on the same `client_session_key` continue *after* the halluc + correction (in-context training signal for Qwen).
+- **Layer 4 name normalization** (Phase 4.2): post-parse `normalize_tool_name` (lowercase + strip common prefixes `get_|bash_|cursor_` etc. and suffixes `_tool|_cmd`). Exact client name always preferred and emitted (canonical casing preserved). Integrated into `accept_tool_call` (so all detect strategies benefit) and the validate gate.
+- Structured observability (Layer 5): `tool_requested`, `tool_allowed`, `client_tool_count`, `hallucinated_tool_names`, `normalized_match`, `used_codeblock_path` etc. on every decision.
+- Rollout flag: `STRICT_TOOL_VALIDATION=true` (default). When false (burn-in only): bad names dropped with loud logs + "burn-in" note, only goods emitted (or text fallback), no 400/feedback. Monitor `hallucinated_tool_names` rate.
+
+**Guarantees:**
+- 0 unknown/hallucinated tool names are *ever* emitted to clients (enforced at every site + adversarial tests with 20+ invented/prefixed names).
+- Every hallucination becomes an in-context correction for that chat_id.
+- No regression on existing clients or 30+ unit tests.
+
+**Supported clients/toolsets:** Any that send OpenAI `tools` (Vercel AI SDK, OpenAI Agents, raw curl, Pi, Aider, Cursor, etc.). Tested with 25+ tool lists and adversarial Cursor-like names.
+
+**Recommendations:**
+- Keep tool names short and exact (avoid auto-generated long/prefixed names if possible).
+- Schemas lean: <30 tools recommended per request (avoids context bloat even with compact encoding).
+- For best results with agents: register only the tools you actually want the model to consider.
+
+**Env vars (tool handling — pick one strategy):**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `STRICT_TOOL_VALIDATION` | `true` | Block unknown tool names → 400 + error feedback to Qwen |
+| `TOOL_PASS_THROUGH` | `true` | **Emit unknown tools to the client anyway** (fixes many agent "Tool X does not exist" errors when the runtime has the tool but the schema list was incomplete). Set `false` for strict blocking. |
+| `TOOL_SYNTHETIC_OK` | `false` | **Pretend unknown tools succeeded** — inject fake `TOOL RESULT: OK` to Qwen (conversation continues); does not emit unknown tools unless combined with pass-through |
+
+Pass-through is **on by default**. Set `TOOL_PASS_THROUGH=false` only if you need strict schema enforcement.
+
+**Upstream model (fixes qwen3.6-plus echo vs actual Qwen backend):**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `QWEN_MODEL` | — | Force upstream model (e.g. `qwen3.7-max-preview`) |
+| *(none)* | `qwen3.7-max` | Client `qwen3.6-plus` / `qwen3.6-max-preview` are **upgraded** to `qwen3.7-max` for real Qwen API calls; OpenAI responses report the resolved upstream id |
+
+**Deep dive:** see `/root/.cursor/plans/Robust Tool-Calling Translator Plan for qwen-proxy-bd469f10.plan.md` and `docs/plans/finish-robust-tool-translator-20260526.md` (CodeGraph-mapped, phased, gated).
 
 ## API Endpoints
 

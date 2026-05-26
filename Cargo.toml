@@ -4,13 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-smol = "2"
 hyper = { version = "1", features = ["server", "http1"] }
 http-body = "1"
 http-body-util = "0.1"
 http = "1"
 ureq = { version = "2", features = ["json"] }
-smol-hyper = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
@@ -25,3 +23,10 @@ dashmap = "6"
 signal-hook = "0.3"
 reqwest = { version = "0.11", features = ["stream", "json"] }
 bytes = "1"
+
+# Tokio is now the single async runtime (replaces smol + smol-hyper)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

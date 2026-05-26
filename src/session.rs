@@ -8,7 +8,7 @@
 //!  - Redundant second last_used.lock().await in acquire() removed.
 //!  - session_ttl() / max_sessions() cached with OnceLock — no env::var parse on hot path.
 
-use crate::constants::{MODEL_NAME, QWEN_API_BASE};
+use crate::constants::QWEN_API_BASE;
 use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
 use futures::lock::{Mutex, OwnedMutexGuard};
@@ -149,10 +149,10 @@ impl SessionManager {
 
     async fn create_chat(&self, token: &str) -> Result<String> {
         let token = token.to_string();
-        smol::unblock(move || {
+        tokio::task::spawn_blocking(move || {
             let payload = serde_json::json!({
                 "title": "Agent Chat",
-                "models": [MODEL_NAME],
+                "models": [crate::constants::qwen_upstream_model(None)],
                 "chat_mode": "normal",
                 "chat_type": "t2t",
                 "timestamp": chrono::Utc::now().timestamp_millis(),
@@ -178,6 +178,7 @@ impl SessionManager {
                 .context("No chat ID in response")
         })
         .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {}", e))?
     }
 
     fn cleanup_expired(&self) {
