@@ -14,14 +14,15 @@ use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use qwen::*;
 use session::SessionManager;
-use smol_hyper;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tracing::{debug, error, info, info_span, Instrument};
+use tokio::net::TcpListener as TokioTcpListener;
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 struct AppState {
     sessions: SessionManager,
@@ -270,6 +271,44 @@ fn append_sse_delta(acc: &mut AccumulatedText, ch: &serde_json::Value) {
     }
 }
 
+/// Phase 3: small helper for best-effort detached feedback in stream error paths.
+/// Client-visible error is emitted immediately; the send is spawned (no await, no added latency).
+/// Reuses the send_qwen_chat_continuation (from 3.1) which handles logs, timeout, None-on-fail.
+fn spawn_feedback_if_hallucinated(chat_id: String, parent_id: Option<String>, fb: String, token: String) {
+    tokio::spawn(async move {
+        let _ = send_qwen_chat_continuation(&chat_id, parent_id.as_deref(), &fb, &token).await;
+    });
+}
+
+/// Small helper to DRY the 400 error shape for bad tool names (used by raw-body + non-stream validate err paths).
+/// (The non-stream detect_qwen_tool_error path uses a similar shape but with upstream err_msg, so keeps local build.)
+/// Keeps "available_tools" for client debugging (per Phase 2/4).
+fn construct_tool_error_json(bad_names: &[String], tools: &[serde_json::Value]) -> serde_json::Value {
+    let mut err = serde_json::json!({
+        "message": format!("Invalid tool call(s): {}. Only use exact names from the client's Available Tools list.", bad_names.join(", ")),
+        "type": "invalid_request_error",
+    });
+    err["available_tools"] = serde_json::json!(tools);
+    serde_json::json!({"error": err})
+}
+
+/// Phase 3 helpers (DRY): build the exact feedback strings used for in-context correction.
+/// One for validate bad-names (used at all 4 gated emission sites + now detect_qwen non-stream),
+/// one for upstream Qwen tool errors (detect_qwen paths). See plan §3.2/3.3/4.1.
+fn build_tool_hallucination_feedback(bad_names: &[String]) -> String {
+    format!(
+        "TOOL RESULT: ERROR: You attempted to call tool(s) {:?} which are not in the Available Tools list. Only use exact names from the list the client provided. Retry with a valid tool or respond in plain text without a tool call.",
+        bad_names
+    )
+}
+
+fn build_qwen_tool_error_feedback(err_msg: &str) -> String {
+    format!(
+        "TOOL RESULT: ERROR: Qwen reported tool error: {}. Only use exact names from the list the client provided. Retry with a valid tool or respond in plain text without a tool call.",
+        err_msg
+    )
+}
+
 /// fix(#2): stable FNV-1a hasher — deterministic across process restarts,
 /// zero extra dependencies, and faster than DefaultHasher for short strings.
 fn fnv1a_hash(s: &str) -> u64 {
@@ -431,10 +470,16 @@ async fn handler(
     let prompt = if tools.is_empty() {
         msg
     } else {
+        // Phase 1 Prompt Engineering Hardening (Robust Tool-Calling Translator; Phases 3-5 completed 2026-05 per docs/plans/finish-robust-tool-translator-20260526.md)
+        // - Compact JSON (no pretty-print bloat)
+        // - Reinforce codeblock + "exact name from the list" (removes the raw-JSON conflict with build_message)
+        // - For response_format=json_* the build_message already emitted the correct "no markdown" rule;
+        //   we still give the compact list + strict "use exact names" guidance.
+        let compact_tools = serde_json::to_string(&tools).unwrap_or_default();
         format!(
-            "{}\n\nAvailable functions:\n{}\n\nWhen you need to use a function, respond with: {{\"tool\":\"<name>\",\"args\":{{...}}}}.",
+            "{}\n\nAvailable Tools (exact names only — use these verbatim):\n{}\n\nWhen you need to call a tool, output ONLY a complete ```json fenced code block as the very last thing in your response, using an exact name from the list above. Never invent names. The block must contain nothing except the JSON.",
             msg,
-            serde_json::to_string_pretty(&tools).unwrap_or_default()
+            compact_tools
         )
     };
 
@@ -455,18 +500,16 @@ async fn handler(
         let rf = response_format.clone();
         let span = info_span!("stream", id = %completion_id, model = %model, tools = tools.len(), response_format = %rf.as_ref().map(|rf| format!("{:?}", rf.get("type"))).unwrap_or_else(|| "none".to_string()));
         async move {
-        // Fix #2 + #9: use QwenSseStream (truly async, no thread held) with a small
-        // backpressure buffer of 8 instead of the old 256-slot smol::channel.
-        let (tx, rx) = smol::channel::bounded::<Result<String, String>>(8);
+        // Tokio mpsc replaces previous smol::channel for backpressure (8 line buffer)
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(8);
 
         let tx2 = tx.clone();
         let headers2 = headers.clone();
         let qwen_url2 = qwen_url.clone();
         let body2 = Arc::clone(&body_arc);
 
-        // Fix #1 + #2: spawn truly-async SSE reader using streaming::post_sse.
-        // No thread is held for the full stream duration.
-        smol::spawn(async move {
+        // Spawn the upstream SSE reader (now under Tokio)
+        tokio::spawn(async move {
             let mut sse = match streaming::post_sse(
                 qwen_url2,
                 headers2,
@@ -474,14 +517,10 @@ async fn handler(
             ).await {
                 Ok(s) => s,
                 Err(e) => {
-                    // Fix #5: use async .send() for backpressure — never drops lines.
                     let _ = tx2.send(Err(e)).await;
-                    drop(tx2);
                     return;
                 }
             };
-            // Fix #5: async send with backpressure — replaces try_send which silently
-            // dropped lines when the consumer was slow.
             while let Some(item) = StreamExt::next(&mut sse).await {
                 match item {
                     Ok(line_sse) => {
@@ -495,25 +534,31 @@ async fn handler(
                     }
                 }
             }
-            drop(tx2);
-        }).detach();
+            // Sender is dropped here → receiver will see None on next recv
+        });
 
         let has_tools = !tools.is_empty();
         let is_responses_api = is_responses_api;
+        // Phase 3: capture for detached feedback spawns in error arms below (no tuple bloat needed; closure captures persist across unfold steps)
+        let chat_id_for_fb = session_id.clone();
+        let token_for_fb = st.token.clone();
         let sse_stream = futures::stream::unfold(
             (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize, false, false, String::new()),
-            move |(rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut resp_created, mut output_started, mut item_id)| {
+            move |(mut rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut resp_created, mut output_started, mut item_id)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let rf = rf.clone();
                 let completion_id = completion_id.clone();
                 let model = model.clone();
+                // Phase 3: clone the fb context *per unfold step* (FnMut requires non-move for reusable closure; async move consumes the step-local clones)
+                let chat_id_for_fb = chat_id_for_fb.clone();
+                let token_for_fb = token_for_fb.clone();
                 async move {
                     if done {
                         return None;
                     }
                     match rx.recv().await {
-                        Ok(Ok(line)) => {
+                        Some(Ok(line)) => {
                             // Track whether this chunk signals stream completion.
                             let mut stream_finished = false;
                             if let Some(data) = parse_qwen_sse_line(&line) {
@@ -551,9 +596,48 @@ async fn handler(
                             }
                             // Fix #6: only run detect_tools on the finished delta to avoid
             // O(n²) scanning on every intermediate chunk.
+                            // Phase 4: full_text accumulation (AccumulatedText) + terminal-only detect already provides
+                            // complete payload for validate before any build_tool_call_stream_chunks or responses-api
+                            // emission. No extra end-of-stream buffering required for name validation (tool JSON is atomic).
                             if !tool_emitted && !content_emitted && stream_finished {
-                                let tcs = detect_tools(full_text.full_answer(), &tools);
+                                let raw_tcs = detect_tools(full_text.full_answer(), &tools);
+                                let tcs = match validate_tool_calls(raw_tcs, &tools) {
+                                    Ok(good) => good,
+                                    Err(bad_names) => {
+                                        error!(
+                                            hallucinated_tool_names = ?bad_names,
+                                            client_tool_count = tools.len(),
+                                            "Phase 2 hard gate: blocking hallucinated tool names from mid-stream emission"
+                                        );
+                                        let err_msg = format!("Invalid tool call(s): {}. Only use exact names from the client's Available Tools list.", bad_names.join(", "));
+                                        if is_responses_api {
+                                            oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                                                "type": "error",
+                                                "error": {"message": err_msg, "type": "tool_error"},
+                                            })).unwrap_or_default());
+                                        } else {
+                                            oai_chunks.push(build_stream_chunk(
+                                                &completion_id, &model, created,
+                                                serde_json::json!({"content": format!("[Tool Error: {}]", err_msg)}),
+                                                Some("stop"),
+                                            ));
+                                        }
+                                        // Phase 3: spawn detached feedback (best-effort; client error sent immediately)
+                                        let pid_for_fb = parent_store.lock().await.clone();
+                                        let fb = build_tool_hallucination_feedback(&bad_names);
+                                        spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
+                                        info!(chat_id = %chat_id_for_fb, hallucinated = ?bad_names, "Phase 3 feedback spawned async (mid-stream)");
+                                        let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
+                                    }
+                                };
                                 if !tcs.is_empty() {
+                                    info!(
+                                        client_tool_count = tools.len(),
+                                        emitted_tool_count = tcs.len(),
+                                        tool_names = ?tcs.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                                        "Streaming: emitting validated tool calls to client (Phase 2 hard gate passed)"
+                                    );
                                     for (i, tc) in tcs.iter().enumerate() {
                                         info!(tool = %tc.name, index = i, "Detected tool call");
                                         let tid = format!("call_{}", uuid::Uuid::new_v4());
@@ -652,7 +736,7 @@ async fn handler(
                             }
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
                         }
-                        Ok(Err(err_str)) => {
+                        Some(Err(err_str)) => {
                             let err_chunk = format!(
                                 "data: {}\n\ndata: [DONE]\n\n",
                                 build_stream_chunk(&completion_id, &model, created,
@@ -662,7 +746,7 @@ async fn handler(
                             );
                             Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
                         }
-                        Err(_) => {
+                        None => {   // all senders dropped (normal end or error path)
                             let mut final_chunks = String::new();
                             if !tool_emitted && !content_emitted {
                                 let answer = full_text.full_answer().to_string();
@@ -683,11 +767,55 @@ async fn handler(
                                                 )
                                             ));
                                         }
+                                        // Phase 3: spawn detached feedback for detect_qwen_tool_error path (best-effort)
+                                        let pid_for_fb = parent_store.lock().await.clone();
+                                        let fb = build_qwen_tool_error_feedback(&err_msg);
+                                        spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
+                                        info!(chat_id = %chat_id_for_fb, error = %err_msg, "Phase 3 feedback spawned async (stream detect_qwen err)");
                                         return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
                                     }
                                 }
-                                let tcs = detect_tools(&answer, &tools);
+                                // Phase 4: full_text accumulation + terminal-only detect already provides complete payload
+                                // for validate before emission. No extra buffering required (see mid-stream comment).
+                                let raw_tcs = detect_tools(&answer, &tools);
+                                let tcs = match validate_tool_calls(raw_tcs, &tools) {
+                                    Ok(good) => good,
+                                    Err(bad_names) => {
+                                        error!(
+                                            hallucinated_tool_names = ?bad_names,
+                                            client_tool_count = tools.len(),
+                                            "Phase 2 hard gate: blocking hallucinated tool names from stream-end emission"
+                                        );
+                                        let err_msg = format!("Invalid tool call(s): {}. Only use exact names from the client's Available Tools list.", bad_names.join(", "));
+                                        if is_responses_api {
+                                            final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                "type": "error",
+                                                "error": {"message": err_msg, "type": "tool_error"},
+                                            })).unwrap_or_default()));
+                                        } else {
+                                            final_chunks.push_str(&format!(
+                                                "data: {}\n\n",
+                                                build_stream_chunk(&completion_id, &model, created,
+                                                    serde_json::json!({"content": format!("[Tool Error: {}]", err_msg)}),
+                                                    Some("stop"),
+                                                )
+                                            ));
+                                        }
+                                        // Phase 3: spawn detached feedback (stream-end validate err path)
+                                        let pid_for_fb = parent_store.lock().await.clone();
+                                        let fb = build_tool_hallucination_feedback(&bad_names);
+                                        spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
+                                        info!(chat_id = %chat_id_for_fb, hallucinated = ?bad_names, "Phase 3 feedback spawned async (stream-end)");
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
+                                    }
+                                };
                                 if !tcs.is_empty() {
+                                    info!(
+                                        client_tool_count = tools.len(),
+                                        emitted_tool_count = tcs.len(),
+                                        tool_names = ?tcs.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                                        "Stream end: emitting validated tool calls to client (Phase 2 hard gate passed)"
+                                    );
                                     if is_responses_api {
                                         for (i, tc) in tcs.iter().enumerate() {
                                             info!(tool = %tc.name, index = i, "Detected tool call at stream end");
@@ -822,32 +950,40 @@ async fn handler(
         Ok(response)
     }.instrument(span).await
     } else {
-        // Fix #8: async reqwest instead of ureq+smol::unblock — no thread held.
-        let ns_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(180))
-            .build()
-            .unwrap_or_default();
-        let mut ns_req = ns_client.post(&qwen_url);
-        for (k, v) in &headers {
-            ns_req = ns_req.header(k.as_str(), v.as_str());
-        }
-        ns_req = ns_req.body((*body_arc).clone());
-        match ns_req.send().await {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
+        // Use tokio::task::spawn_blocking for the blocking ureq call (now safe under Tokio runtime)
+        let body_arc2 = Arc::clone(&body_arc);
+        let qwen_url2 = qwen_url.clone();
+        let headers2 = headers.clone();
+        let http_res: Result<(u16, String), String> = tokio::task::spawn_blocking(move || {
+            let mut req = ureq::post(&qwen_url2);
+            for (k, v) in &headers2 {
+                req = req.set(k.as_str(), v.as_str());
+            }
+            req = req.set("accept", "text/event-stream");
+            match req.send_bytes(&*body_arc2) {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body_text = resp.into_string().unwrap_or_default();
+                    Ok((status, body_text))
+                }
+                Err(e) => Err(format!("Qwen request failed: {}", e)),
+            }
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join error: {}", e))
+        .unwrap_or_else(|e| Err(e));
+
+        match http_res {
+            Ok((status, body_text)) => {
+                if !(200..300).contains(&status) {
                     let preview: String = body_text.chars().take(500).collect();
                     error!(status = %status, body_preview = %preview, "Qwen chat/completions returned error");
-                    if status.as_u16() == 429 || body_text.contains("in progress") {
+                    if status == 429 || body_text.contains("in progress") {
                         return Ok(internal_error("Qwen chat is busy (another message in flight on this chat_id)").map(|b| box_body(b)));
                     }
                     return Ok(internal_error(format!("Qwen API returned {}", status)).map(|b| box_body(b)));
                 }
-                let body_text = match response.text().await {
-                    Ok(t) => t,
-                    Err(e) => return Ok(internal_error(format!("Failed to read response: {}", e)).map(|b| box_body(b))),
-                };
+                // body_text now from blocking ureq; proceed with original line processing (includes set_parent_id awaits)
                 let mut acc = AccumulatedText::new();
                 for line in body_text.lines() {
                     if let Some(data) = parse_qwen_sse_line(line) {
@@ -861,6 +997,7 @@ async fn handler(
                     }
                 }
 
+                let latest_pid = parent_store.lock().await.clone(); // captured post-processing; all sets from the line loop above are visible
                 let full_text = acc.full_answer().to_string();
                 let completion_tokens = estimate_tokens(&full_text);
                 let total_tokens = prompt_tokens + completion_tokens;
@@ -878,7 +1015,44 @@ async fn handler(
                 }
 
                 if full_text.is_empty() && !tools.is_empty() {
-                    let tcs = detect_tools(&body_text, &tools);
+                    // Phase 4.1 / 3.4: close the raw-body bypass (was detect + direct emit with zero validate).
+                    // Now uniform hard gate + feedback like the other 3 emission sites. Unknown names *never* leak.
+                    let raw_tcs = detect_tools(&body_text, &tools);
+                    let tcs = match validate_tool_calls(raw_tcs, &tools) {
+                        Ok(good) => good,
+                        Err(bad_names) => {
+                            error!(
+                                hallucinated_tool_names = ?bad_names,
+                                client_tool_count = tools.len(),
+                                "Phase 4.1 hard gate: blocking hallucinated tool names from raw-body emission (was bypass)"
+                            );
+                            // Same fb synthesis + await send + set + 400 as the full_text non-stream path (now DRY-able via helper)
+                            let fb = build_tool_hallucination_feedback(&bad_names);
+                            if let Some(pid) = &latest_pid {
+                                match send_qwen_chat_continuation(&session_id, Some(pid), &fb, &st.token).await {
+                                    Ok(Some(new_pid)) => {
+                                        session.set_parent_id(new_pid.clone()).await;
+                                        info!(
+                                            chat_id = %session_id,
+                                            new_parent = %new_pid,
+                                            hallucinated = ?bad_names,
+                                            "Phase 3: feedback injected into Qwen chat — hallucination now in-context correction (raw body path)"
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        warn!(chat_id = %session_id, "Phase 3: feedback send completed with no new_pid (raw body, best-effort)");
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, chat_id = %session_id, "Phase 3: feedback send failed (raw body, non-fatal, client still gets clean 400)");
+                                    }
+                                }
+                            } else {
+                                warn!(chat_id = %session_id, "Phase 3: no latest_pid captured in raw body; skipping injection (still 400)");
+                            }
+                            let err_body = construct_tool_error_json(&bad_names, &tools);
+                            return Ok(json_response(StatusCode::BAD_REQUEST, &err_body).map(|b| box_body(b)));
+                        }
+                    };
                     if !tcs.is_empty() {
                         let tool_calls: Vec<serde_json::Value> = tcs.iter().enumerate().map(|(i, tc)| {
                             info!(tool = %tc.name, index = i, "Detected tool call in raw body");
@@ -914,7 +1088,7 @@ async fn handler(
                                 "total_tokens": prompt_tokens
                             }
                         });
-                        info!(count = tcs.len(), "Returning tool calls from raw body");
+                        info!(count = tcs.len(), "Returning tool calls from raw body (validated Phase 4.1)");
                         return Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)));
                     }
                 }
@@ -922,6 +1096,31 @@ async fn handler(
                 if !full_text.is_empty() && !tools.is_empty() {
                     if let Some(err_msg) = detect_qwen_tool_error(&full_text) {
                         error!(error = %err_msg, "Qwen returned tool error in response text");
+                        // Phase 3: feedback injection for non-stream detect_qwen_tool_error (closes coverage gap;
+                        // stream detect_qwen paths already had spawn; now uniform with validate errs per plan §3.3).
+                        // Uses same await+set_parent pattern as the sibling non-stream validate err arm below.
+                                        let fb = build_qwen_tool_error_feedback(&err_msg);
+                        if let Some(pid) = &latest_pid {
+                            match send_qwen_chat_continuation(&session_id, Some(pid), &fb, &st.token).await {
+                                Ok(Some(new_pid)) => {
+                                    session.set_parent_id(new_pid.clone()).await;
+                                    info!(
+                                        chat_id = %session_id,
+                                        new_parent = %new_pid,
+                                        error = %err_msg,
+                                        "Phase 3: feedback injected into Qwen chat for non-stream detect_qwen_tool_error"
+                                    );
+                                }
+                                Ok(None) => {
+                                    warn!(chat_id = %session_id, "Phase 3: feedback send completed with no new_pid (detect_qwen non-stream, best-effort)");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, chat_id = %session_id, "Phase 3: feedback send failed (detect_qwen non-stream, non-fatal, client still gets clean 400)");
+                                }
+                            }
+                        } else {
+                            warn!(chat_id = %session_id, "Phase 3: no latest_pid captured for detect_qwen non-stream; skipping injection (still 400)");
+                        }
                         let mut err = serde_json::json!({
                             "message": err_msg,
                             "type": "invalid_request_error",
@@ -934,7 +1133,55 @@ async fn handler(
                     }
                 }
 
-                let tcs = detect_tools(&full_text, &tools);
+                let raw_tcs = detect_tools(&full_text, &tools);
+                let tcs = match validate_tool_calls(raw_tcs, &tools) {
+                    Ok(good) => good,
+                    Err(bad_names) => {
+                        error!(
+                            hallucinated_tool_names = ?bad_names,
+                            client_tool_count = tools.len(),
+                            "Phase 2 hard gate: blocking hallucinated tool names from non-stream response"
+                        );
+                        // Phase 3 Feedback/Recovery IMPLEMENTED (see send_qwen_chat_continuation in qwen.rs):
+                        // We synthesize the exact "TOOL RESULT: ERROR..." and POST it as continuation using the
+                        // latest parent_id from this turn. The returned new_pid is set so future turns on this
+                        // client_session_key continue *after* the halluc + correction (in-context training signal).
+                        let fb = build_tool_hallucination_feedback(&bad_names);
+                        if let Some(pid) = &latest_pid {
+                            match send_qwen_chat_continuation(&session_id, Some(pid), &fb, &st.token).await {
+                                Ok(Some(new_pid)) => {
+                                    session.set_parent_id(new_pid.clone()).await;
+                                    info!(
+                                        chat_id = %session_id,
+                                        new_parent = %new_pid,
+                                        hallucinated = ?bad_names,
+                                        "Phase 3: feedback injected into Qwen chat — hallucination now in-context correction"
+                                    );
+                                }
+                                Ok(None) => {
+                                    warn!(chat_id = %session_id, "Phase 3: feedback send completed with no new_pid (best-effort)");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, chat_id = %session_id, "Phase 3: feedback send failed (non-fatal, client still gets clean 400)");
+                                }
+                            }
+                        } else {
+                            warn!(chat_id = %session_id, "Phase 3: no latest_pid captured; skipping feedback injection (still returning 400 to client)");
+                        }
+                        // Phase 4.1: using shared constructor (DRY with raw-body path)
+                        let err_body = construct_tool_error_json(&bad_names, &tools);
+                        return Ok(json_response(StatusCode::BAD_REQUEST, &err_body).map(|b| box_body(b)));
+                    }
+                };
+
+                if !tcs.is_empty() {
+                    info!(
+                        client_tool_count = tools.len(),
+                        emitted_tool_count = tcs.len(),
+                        tool_names = ?tcs.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                        "Non-stream final: emitting validated tool calls to client (Phase 2 hard gate passed)"
+                    );
+                }
 
                 let resp_value = if !tcs.is_empty() {
                     let tool_calls: Vec<serde_json::Value> = tcs.iter().enumerate().map(|(i, tc)| {
@@ -1057,7 +1304,7 @@ async fn handler(
                 Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)))
             }
             Err(e) => {
-                error!(error = %e, "Qwen API call failed");
+                error!(error = %e, "Qwen API call failed (unblock)");
                 Ok(internal_error(format!("Qwen API error: {}", e)).map(|b| box_body(b)))
             }
         }
@@ -1182,7 +1429,7 @@ fn main() -> Result<()> {
         .unwrap_or(8765);
     let addr = format!("0.0.0.0:{}", port);
 
-    info!("Qwen OpenAI proxy (smol+hyper) listening on http://{}", addr);
+    info!("Qwen OpenAI proxy (tokio+hyper) listening on http://{}", addr);
 
     let term = Arc::new(AtomicBool::new(false));
     if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term)) {
@@ -1192,8 +1439,14 @@ fn main() -> Result<()> {
         error!(error = %e, "Failed to register SIGTERM handler");
     }
 
-    smol::block_on(async {
-        let listener = smol::net::TcpListener::bind(&addr)
+    // Tokio runtime (replaces previous smol::block_on)
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build Tokio runtime");
+
+    rt.block_on(async {
+        let listener = TokioTcpListener::bind(&addr)
             .await
             .expect("Failed to bind address");
 
@@ -1202,7 +1455,7 @@ fn main() -> Result<()> {
             let accept_fut = Box::pin(listener.accept());
             let check_fut = Box::pin(async {
                 loop {
-                    smol::Timer::after(Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     if term.load(Ordering::Relaxed) {
                         break;
                     }
@@ -1211,8 +1464,8 @@ fn main() -> Result<()> {
             match futures::future::select(accept_fut, check_fut).await {
                 Either::Left((Ok((stream, peer)), _)) => {
                     let state = state.clone();
-                    smol::spawn(async move {
-                        let stream = smol_hyper::rt::FuturesIo::new(stream);
+                    tokio::spawn(async move {
+                        let stream = TokioIo::new(stream);
                         let service = service_fn(move |req: Request<Incoming>| {
                             router(req, state.clone())
                         });
@@ -1224,8 +1477,8 @@ fn main() -> Result<()> {
                         {
                             debug!("Connection error from {}: {}", peer, e);
                         }
-                    })
-                    .detach();
+                    });
+                    // No .detach() needed — Tokio tasks are fire-and-forget by default
                 }
                 Either::Left((Err(e), _)) => {
                     error!("Accept error: {}", e);
