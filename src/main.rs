@@ -496,7 +496,7 @@ async fn handler(
         let has_tools = !tools.is_empty();
         let sse_stream = futures::stream::unfold(
             (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize),
-            move |(rx, mut buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len)| {
+            move |(rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let rf = rf_inner.clone();
@@ -1080,5 +1080,6 @@ fn main() -> Result<()> {
         }
 
         info!("Shutdown complete");
-    })
+    });
+    Ok(())
 }
