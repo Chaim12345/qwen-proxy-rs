@@ -6,13 +6,14 @@
 //!    (original try_lock silently fell back to created_at, picking wrong victim).
 //!  - cleanup_expired() gated to run at most once per 60 s (was on every request).
 //!  - Redundant second last_used.lock().await in acquire() removed.
+//!  - session_ttl() / max_sessions() cached with OnceLock — no env::var parse on hot path.
 
 use crate::constants::{MODEL_NAME, QWEN_API_BASE};
 use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
 use futures::lock::{Mutex, OwnedMutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
@@ -23,19 +24,27 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Cached at first call — no env::var parse on the hot path.
 fn session_ttl() -> Duration {
-    let minutes = std::env::var("QWEN_PROXY_SESSION_TTL_MINUTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30u64);
-    Duration::from_secs(minutes * 60)
+    static TTL: OnceLock<Duration> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        let minutes = std::env::var("QWEN_PROXY_SESSION_TTL_MINUTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        Duration::from_secs(minutes * 60)
+    })
 }
 
+/// Cached at first call — no env::var parse on the hot path.
 fn max_sessions() -> usize {
-    std::env::var("QWEN_PROXY_MAX_SESSIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100)
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("QWEN_PROXY_MAX_SESSIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100)
+    })
 }
 
 #[derive(Clone)]
