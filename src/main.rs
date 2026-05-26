@@ -579,7 +579,6 @@ async fn handler(
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
                                     return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
                                 }
-                                }
                                 let answer = full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
                                 if !visible.is_empty() {
