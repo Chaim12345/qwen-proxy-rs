@@ -524,6 +524,7 @@ fn accept_tool_call(tc: ToolCall, tool_names: &[&str]) -> Option<ToolCall> {
 }
 
 /// Detect tool calls in text using multiple strategies.
+/// Strategies are tried in order of cost; early returns avoid redundant work (#11).
 pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     let normalized = normalize_tool_call_text(text);
     let tool_names: Vec<&str> = tool_defs
@@ -543,7 +544,7 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
         if !found.contains(&tc) { found.push(tc); }
     };
 
-    // Strategy 1: markdown code blocks
+    // Strategy 1: markdown code blocks (cheapest — one regex pass)
     for cap in MARKDOWN_CODE_RE.captures_iter(&normalized) {
         let json_str = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
         if let Some(tc) = try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names)) {
@@ -551,6 +552,8 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
             add_unique(tc);
         }
     }
+    // Short-circuit: if Strategy 1 found results, skip costlier strategies (#11)
+    if !found.is_empty() { return found; }
 
     // Strategy 2: scan for JSON objects that explicitly contain "tool" key
     let blocks = extract_json_blocks(&normalized);
@@ -560,6 +563,8 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
             add_unique(tc);
         }
     }
+    // Short-circuit: if Strategy 2 found results, skip Strategy 3 (#11)
+    if !found.is_empty() { return found; }
 
     // Strategy 3: line-by-line scan
     for line in normalized.lines() {
@@ -644,7 +649,7 @@ mod tests {
 
     #[test]
     fn test_detect_tool_deeply_nested_json() {
-        let text = r#"{"tool":"write","args":{"path":"test.json","content":"{\\"key\\": \\"value\\"}"}}"#;
+        let text = r#"{"tool":"write","args":{"path":"test.json","content":"{\"key\": \"value\"}"}}"#;
         let tools = vec![serde_json::json!({"name":"write","description":"","parameters":{}})]; 
         let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
