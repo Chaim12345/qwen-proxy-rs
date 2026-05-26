@@ -861,9 +861,10 @@ async fn handler(
                             "created_at": created,
                             "model": model,
                             "output": [{
+                                "id": format!("msg_{}", uuid::Uuid::new_v4()),
                                 "type": "message",
                                 "role": "assistant",
-                                "content": [{"type": "output_text", "text": visible}]
+                                "content": [{"type": "output_text", "text": visible, "annotations": []}]
                             }],
                             "usage": {
                                 "input_tokens": prompt_tokens,
