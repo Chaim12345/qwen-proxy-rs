@@ -494,9 +494,10 @@ async fn handler(
         }).detach();
 
         let has_tools = !tools.is_empty();
+        let is_responses_api = is_responses_api;
         let sse_stream = futures::stream::unfold(
-            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize),
-            move |(rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len)| {
+            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize, false, false, String::new()),
+            move |(rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut resp_created, mut output_started, mut item_id)| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let rf = rf_inner.clone();
@@ -519,6 +520,17 @@ async fn handler(
                                 }
                             }
                             let mut oai_chunks: Vec<String> = Vec::new();
+                            if is_responses_api && !resp_created {
+                                oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                                    "type": "response.created",
+                                    "response": {
+                                        "id": completion_id,
+                                        "created_at": created,
+                                        "model": model,
+                                    }
+                                })).unwrap_or_default());
+                                resp_created = true;
+                            }
                             let thinking = full_text.thinking();
                             if thinking.len() > prev_thinking_len {
                                 let delta = &thinking[prev_thinking_len..];
@@ -536,12 +548,37 @@ async fn handler(
                                         info!(tool = %tc.name, index = i, "Detected tool call");
                                         let tid = format!("call_{}", uuid::Uuid::new_v4());
                                         let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
-                                        for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
-                                            oai_chunks.push(s);
+                                        if is_responses_api {
+                                            if !output_started {
+                                                oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                                                    "type": "response.output_item.added",
+                                                    "output_index": i,
+                                                    "item": {
+                                                        "id": tid,
+                                                        "type": "function_call",
+                                                        "call_id": tid.clone(),
+                                                        "name": tc.name,
+                                                        "arguments": "",
+                                                    }
+                                                })).unwrap_or_default());
+                                                item_id = tid.clone();
+                                                output_started = true;
+                                            }
+                                            oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                                                "type": "response.function_call_arguments.delta",
+                                                "item_id": tid,
+                                                "output_index": i,
+                                                "delta": args,
+                                            })).unwrap_or_default());
+                                        } else {
+                                            for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
+                                                oai_chunks.push(s);
+                                            }
                                         }
                                     }
                                     let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len)));
+                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
+                                }
                                 }
                                 let answer = full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
@@ -559,18 +596,41 @@ async fn handler(
                                 };
                                 if visible.len() > prev_len {
                                     let delta = &visible[prev_len..];
-                                    if prev_len == 0 {
-                                        oai_chunks.push(build_stream_chunk(
-                                            &completion_id, &model, created,
-                                            serde_json::json!({"role": "assistant", "content": delta.to_string()}),
-                                            None,
-                                        ));
+                                    if is_responses_api {
+                                        if !output_started {
+                                            let new_id = format!("msg_{}", uuid::Uuid::new_v4());
+                                            item_id = new_id.clone();
+                                            oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                                                "type": "response.output_item.added",
+                                                "output_index": 0,
+                                                "item": {
+                                                    "id": new_id,
+                                                    "type": "message",
+                                                    "role": "assistant",
+                                                    "content": [{"type": "output_text", "text": "", "annotations": []}]
+                                                }
+                                            })).unwrap_or_default());
+                                            output_started = true;
+                                        }
+                                        oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                                            "type": "response.output_text.delta",
+                                            "item_id": item_id,
+                                            "delta": delta,
+                                        })).unwrap_or_default());
                                     } else {
-                                        oai_chunks.push(build_stream_chunk(
-                                            &completion_id, &model, created,
-                                            serde_json::json!({"content": delta.to_string()}),
-                                            None,
-                                        ));
+                                        if prev_len == 0 {
+                                            oai_chunks.push(build_stream_chunk(
+                                                &completion_id, &model, created,
+                                                serde_json::json!({"role": "assistant", "content": delta.to_string()}),
+                                                None,
+                                            ));
+                                        } else {
+                                            oai_chunks.push(build_stream_chunk(
+                                                &completion_id, &model, created,
+                                                serde_json::json!({"content": delta.to_string()}),
+                                                None,
+                                            ));
+                                        }
                                     }
                                     prev_len = visible.len();
                                 } else if visible.len() < prev_len {
@@ -579,9 +639,9 @@ async fn handler(
                             }
                             if !oai_chunks.is_empty() {
                                 let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len)));
+                                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
                             }
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
                         }
                         Ok(Err(err_str)) => {
                             let err_chunk = format!(
@@ -591,7 +651,7 @@ async fn handler(
                                     Some("stop"),
                                 )
                             );
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
                         }
                         Err(_) => {
                             let mut final_chunks = String::new();
@@ -600,25 +660,53 @@ async fn handler(
                                 if has_tools {
                                     if let Some(err_msg) = detect_qwen_tool_error(&answer) {
                                         error!(error = %err_msg, "Qwen returned tool error in stream");
-                                        final_chunks.push_str(&format!(
-                                            "data: {}\n\n",
-                                            build_stream_chunk(&completion_id, &model, created,
-                                                serde_json::json!({"content": format!("[Tool Error: {}]", err_msg)}),
-                                                Some("stop"),
-                                            )
-                                        ));
-                                        final_chunks.push_str("data: [DONE]\n\n");
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)));
+                                        if is_responses_api {
+                                            final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                "type": "error",
+                                                "error": {"message": err_msg, "type": "tool_error"},
+                                            })).unwrap_or_default()));
+                                        } else {
+                                            final_chunks.push_str(&format!(
+                                                "data: {}\n\n",
+                                                build_stream_chunk(&completion_id, &model, created,
+                                                    serde_json::json!({"content": format!("[Tool Error: {}]", err_msg)}),
+                                                    Some("stop"),
+                                                )
+                                            ));
+                                        }
+                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)));
                                     }
                                 }
                                 let tcs = detect_tools(&answer, &tools);
                                 if !tcs.is_empty() {
-                                    for (i, tc) in tcs.iter().enumerate() {
-                                        info!(tool = %tc.name, index = i, "Detected tool call at stream end");
-                                        let tid = format!("call_{}", uuid::Uuid::new_v4());
-                                        let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
-                                        for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
-                                            final_chunks.push_str(&format!("data: {}\n\n", s));
+                                    if is_responses_api {
+                                        for (i, tc) in tcs.iter().enumerate() {
+                                            info!(tool = %tc.name, index = i, "Detected tool call at stream end");
+                                            let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                            if !output_started {
+                                                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                    "type": "response.output_item.added",
+                                                    "output_index": i,
+                                                    "item": {
+                                                        "id": tid,
+                                                        "type": "function_call",
+                                                        "call_id": tid.clone(),
+                                                        "name": tc.name,
+                                                        "arguments": args,
+                                                    }
+                                                })).unwrap_or_default()));
+                                                output_started = true;
+                                            }
+                                        }
+                                    } else {
+                                        for (i, tc) in tcs.iter().enumerate() {
+                                            info!(tool = %tc.name, index = i, "Detected tool call at stream end");
+                                            let tid = format!("call_{}", uuid::Uuid::new_v4());
+                                            let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
+                                            for s in build_tool_call_stream_chunks(&completion_id, &model, created, i, &tid, &tc.name, &args) {
+                                                final_chunks.push_str(&format!("data: {}\n\n", s));
+                                            }
                                         }
                                     }
                                 } else {
@@ -627,22 +715,82 @@ async fn handler(
                                         Ok(v) => v,
                                         Err(e) => {
                                             error!(error = %e, "Structured output validation failed at stream end");
-                                            format!("[Structured Output Error: {}]", e)
+                                            format!("[Structured Output Error: {}", e)
                                         }
                                     };
                                     if !visible.is_empty() {
-                                        final_chunks.push_str(&format!(
-                                            "data: {}\n\n",
-                                            build_stream_chunk(&completion_id, &model, created,
-                                                serde_json::json!({"role": "assistant", "content": visible}),
-                                                Some("stop"),
-                                            )
-                                        ));
+                                        if is_responses_api {
+                                            final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                "type": "response.output_item.added",
+                                                "output_index": 0,
+                                                "item": {
+                                                    "id": format!("msg_{}", uuid::Uuid::new_v4()),
+                                                    "type": "message",
+                                                    "role": "assistant",
+                                                    "content": [{"type": "output_text", "text": visible, "annotations": []}]
+                                                }
+                                            })).unwrap_or_default()));
+                                        } else {
+                                            final_chunks.push_str(&format!(
+                                                "data: {}\n\n",
+                                                build_stream_chunk(&completion_id, &model, created,
+                                                    serde_json::json!({"role": "assistant", "content": visible}),
+                                                    Some("stop"),
+                                                )
+                                            ));
+                                        }
                                     }
                                 }
                             }
+                            if is_responses_api {
+                                if output_started && !tool_emitted {
+                                    final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                        "type": "response.output_item.done",
+                                        "output_index": 0,
+                                        "item": {
+                                            "id": item_id,
+                                            "type": "message",
+                                            "role": "assistant",
+                                            "content": [{"type": "output_text", "text": client_visible_content(full_text.full_answer(), None, has_tools), "annotations": []}]
+                                        }
+                                    })).unwrap_or_default()));
+                                }
+                                let resp_completion_tokens = estimate_tokens(full_text.full_answer());
+                                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                    "type": "response.completed",
+                                    "response": {
+                                        "id": completion_id,
+                                        "object": "response",
+                                        "created_at": created,
+                                        "model": model,
+                                        "usage": {
+                                            "input_tokens": prompt_tokens,
+                                            "output_tokens": resp_completion_tokens,
+                                            "total_tokens": prompt_tokens + resp_completion_tokens,
+                                        }
+                                    }
+                                })).unwrap_or_default()));
+                            } else {
+                                if tool_emitted {
+                                    final_chunks.push_str(&format!(
+                                        "data: {}\n\n",
+                                        build_stream_chunk(&completion_id, &model, created,
+                                            serde_json::json!({}),
+                                            Some("tool_calls"),
+                                        )
+                                    ));
+                                } else if content_emitted {
+                                    final_chunks.push_str(&format!(
+                                        "data: {}\n\n",
+                                        build_stream_chunk(&completion_id, &model, created,
+                                            serde_json::json!({}),
+                                            Some("stop"),
+                                        )
+                                    ));
+                                }
+                            }
                             final_chunks.push_str("data: [DONE]\n\n");
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, resp_created, output_started, item_id)))
                         }
                     }
                 }
