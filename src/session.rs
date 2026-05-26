@@ -10,6 +10,9 @@ use futures::lock::{Mutex, OwnedMutexGuard};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+const MODEL_NAME: &str = "qwen3.7-max";
+const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
+
 fn session_ttl() -> Duration {
     let minutes = std::env::var("QWEN_PROXY_SESSION_TTL_MINUTES")
         .ok()
@@ -24,8 +27,6 @@ fn max_sessions() -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(100)
 }
-const MODEL_NAME: &str = "qwen3.7-max";
-const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
 
 #[derive(Clone)]
 struct SessionEntry {
@@ -61,7 +62,8 @@ impl SessionManager {
     }
 
     /// Get or create a Qwen chat for `client_key`, then wait until no other request is in-flight
-    /// on that chat.
+    /// on that chat. Concurrent sends on the same key are queued, never parallelised — Qwen
+    /// returns 429 if two requests hit the same chat simultaneously.
     pub async fn acquire(&self, client_key: &str, token: &str) -> Result<AcquiredSession> {
         self.cleanup_expired();
 
@@ -144,18 +146,27 @@ impl SessionManager {
     }
 
     fn cleanup_expired(&self) {
+        // retain only sessions that were created within the TTL window
         let cutoff = Instant::now() - session_ttl();
         self.sessions.retain(|_, s| s.created_at > cutoff);
     }
 
     fn evict_oldest(&self) {
-        if let Some(oldest_key) = self
+        // Only evict sessions that are not currently handling a request.
+        // try_lock_owned returns Ok(guard) if the mutex is free; if it fails the
+        // session is in-flight and must not be removed (Qwen would return 429 on
+        // the next request for that chat anyway, causing a new chat to be created).
+        let evict_key = self
             .sessions
             .iter()
+            .filter(|e| e.in_flight.try_lock().is_some())
             .min_by_key(|e| e.created_at)
-            .map(|e| e.key().clone())
-        {
-            self.sessions.remove(&oldest_key);
+            .map(|e| e.key().clone());
+
+        if let Some(key) = evict_key {
+            self.sessions.remove(&key);
         }
+        // If all sessions are in-flight, skip eviction; the next cleanup_expired
+        // call will reclaim them once their TTL expires.
     }
 }
