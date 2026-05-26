@@ -1,7 +1,9 @@
+mod constants;
 mod qwen;
 mod session;
 mod streaming;
 
+use crate::constants::{MODEL_NAME, QWEN_API_BASE};
 use anyhow::{bail, Context, Result};
 
 use futures::StreamExt;
@@ -15,16 +17,11 @@ use hyper::{Request, Response};
 use qwen::*;
 use session::SessionManager;
 use smol_hyper;
-use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, info_span, Instrument};
-
-const MODEL_NAME: &str = "qwen3.7-max";
-const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
 
 struct AppState {
     sessions: SessionManager,
@@ -233,11 +230,12 @@ fn build_tool_call_stream_chunks(
         None,
     ));
 
-    let args_bytes = args_json.as_bytes();
+    // fix(#4): chunk by chars, not raw bytes, so multi-byte UTF-8 is never split.
+    let chars: Vec<char> = args_json.chars().collect();
     let chunk_size = 8;
-    for chunk_start in (0..args_bytes.len()).step_by(chunk_size) {
-        let chunk_end = std::cmp::min(chunk_start + chunk_size, args_bytes.len());
-        let arg_piece = String::from_utf8_lossy(&args_bytes[chunk_start..chunk_end]);
+    for chunk_start in (0..chars.len()).step_by(chunk_size) {
+        let chunk_end = std::cmp::min(chunk_start + chunk_size, chars.len());
+        let arg_piece: String = chars[chunk_start..chunk_end].iter().collect();
         chunks.push(build_stream_chunk(
             id,
             model,
@@ -245,7 +243,7 @@ fn build_tool_call_stream_chunks(
             serde_json::json!({
                 "tool_calls": [{
                     "index": index,
-                    "function": { "arguments": arg_piece.to_string() }
+                    "function": { "arguments": arg_piece }
                 }]
             }),
             None,
@@ -266,6 +264,14 @@ fn append_sse_delta(acc: &mut AccumulatedText, ch: &serde_json::Value) {
     }
 }
 
+/// fix(#2): stable FNV-1a hasher — deterministic across process restarts,
+/// zero extra dependencies, and faster than DefaultHasher for short strings.
+fn fnv1a_hash(s: &str) -> u64 {
+    const OFFSET: u64 = 14695981039346656037;
+    const PRIME: u64 = 1099511628211;
+    s.bytes().fold(OFFSET, |h, b| (h ^ b as u64).wrapping_mul(PRIME))
+}
+
 fn tools_fingerprint(v: &serde_json::Value) -> u64 {
     let Some(tools) = v.get("tools").and_then(|t| t.as_array()) else {
         return 0;
@@ -274,9 +280,7 @@ fn tools_fingerprint(v: &serde_json::Value) -> u64 {
         return 0;
     }
     let serialized = serde_json::to_string(tools).unwrap_or_default();
-    let mut hasher = DefaultHasher::new();
-    serialized.hash(&mut hasher);
-    hasher.finish()
+    fnv1a_hash(&serialized)
 }
 
 fn session_tools_suffix(v: &serde_json::Value) -> String {
@@ -316,9 +320,8 @@ fn client_session_key(v: &serde_json::Value) -> String {
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
                 if !content.is_empty() {
-                    let mut hasher = DefaultHasher::new();
-                    content.hash(&mut hasher);
-                    return format!("conv:{:x}{}", hasher.finish(), tools_suffix);
+                    // fix(#2): use fnv1a_hash instead of DefaultHasher
+                    return format!("conv:{:x}{}", fnv1a_hash(content), tools_suffix);
                 }
             }
         }
@@ -1166,6 +1169,7 @@ fn main() -> Result<()> {
         token,
     });
 
+    // fix(#5): read PORT once at startup rather than on every request.
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
