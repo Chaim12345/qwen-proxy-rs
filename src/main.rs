@@ -451,7 +451,7 @@ fn client_session_key(v: &serde_json::Value) -> String {
     if let Some(msgs) = messages {
         for m in msgs {
             if m.get("role").and_then(|r| r.as_str()) == Some("user") {
-                let content = m
+                let content: String = m
                     .get("content")
                     .and_then(|c| {
                         c.as_str().map(|s| s.to_string()).or_else(|| {
@@ -463,6 +463,7 @@ fn client_session_key(v: &serde_json::Value) -> String {
                                         .or_else(|| {
                                             part.get("output_text").and_then(|v| v.as_str())
                                         })
+                                        .map(|s| s.to_string())
                                 })
                             })
                         })
