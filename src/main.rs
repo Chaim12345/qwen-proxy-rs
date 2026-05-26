@@ -19,7 +19,7 @@ use session::SessionManager;
 use smol_hyper;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{debug, error, info, info_span, Instrument};
 
@@ -130,11 +130,17 @@ const MODELS_JSON: &str = r#"{"object":"list","data":[
 {"id":"qwen3.6-max-preview","object":"model","created":1700000000,"owned_by":"qwen","permission":[],"root":"qwen3.6-max-preview","parent":null}
 ]}"#;
 
+/// perf(#12): build the response bytes exactly once; every request clones the Arc pointer,
+/// not the payload.  Avoids a serde_json deserialise+serialise round-trip per call.
+static MODELS_BYTES: LazyLock<Bytes> = LazyLock::new(|| Bytes::from_static(MODELS_JSON.as_bytes()));
+
 fn models_handler() -> Response<Full<Bytes>> {
-    json_response(
-        StatusCode::OK,
-        &serde_json::from_str::<serde_json::Value>(MODELS_JSON).unwrap(),
-    )
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("content-length", MODELS_BYTES.len().to_string())
+        .body(Full::new(Bytes::clone(&MODELS_BYTES)))
+        .unwrap()
 }
 
 fn model_handler(model_id: &str) -> Response<Full<Bytes>> {
@@ -544,7 +550,7 @@ async fn handler(
                                 prev_thinking_len = thinking.len();
                             }
                             // Fix #6: only run detect_tools on the finished delta to avoid
-                            // O(n²) scanning on every intermediate chunk.
+            // O(n²) scanning on every intermediate chunk.
                             if !tool_emitted && !content_emitted && stream_finished {
                                 let tcs = detect_tools(full_text.full_answer(), &tools);
                                 if !tcs.is_empty() {
