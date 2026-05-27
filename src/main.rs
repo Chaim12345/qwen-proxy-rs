@@ -354,6 +354,20 @@ fn construct_tool_error_json(
     serde_json::json!({"error": err})
 }
 
+/// Build the unified error JSON for upstream Qwen tool errors (e.g. "Tool X does not exist").
+/// Includes `available_tools` for client debugging, matching the hallucinated-tool format.
+fn construct_tool_error_upstream(
+    err_msg: &str,
+    tools: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut err = serde_json::json!({
+        "message": err_msg,
+        "type": "invalid_request_error",
+    });
+    err["available_tools"] = serde_json::json!(tools);
+    serde_json::json!({"error": err})
+}
+
 /// Phase 3 helpers (DRY): build the exact feedback strings used for in-context correction.
 /// One for validate bad-names (used at all 4 gated emission sites + now detect_qwen non-stream),
 /// one for upstream Qwen tool errors (detect_qwen paths). See plan §3.2/3.3/4.1.
@@ -381,6 +395,28 @@ fn extract_tool_name_from_error(err_msg: &str) -> String {
 
 fn build_synthetic_tool_ok_feedback_for_name(_tool_name: &str) -> String {
     "ok pretend it does exist and call it properly anyway".to_string()
+}
+
+/// Shared tool-error recovery: inject synthetic OK into Qwen chat, return continuation response.
+/// Returns `Ok(ContinuationResponse)` on success, `Err` if no parent_id or send failed.
+/// Both stream and non-stream paths call this for consistent recovery behavior.
+async fn tool_error_recovery(
+    chat_id: &str,
+    parent_id: Option<&str>,
+    token: &str,
+    err_msg: &str,
+) -> Result<qwen::ContinuationResponse, anyhow::Error> {
+    let tool_name = extract_tool_name_from_error(err_msg);
+    let ok_fb = build_synthetic_tool_ok_feedback_for_name(&tool_name);
+    let pid = match parent_id {
+        Some(p) => p,
+        None => {
+            warn!(chat_id = %chat_id, "No parent_id for tool error recovery; skipping");
+            anyhow::bail!("no parent_id available for tool error recovery");
+        }
+    };
+    let result = send_qwen_continuation_and_get_response(chat_id, Some(pid), &ok_fb, token).await?;
+    Ok(result)
 }
 
 /// Run validate_tool_calls; on synthetic-ok feedback, spawn best-effort Qwen continuation.
@@ -713,25 +749,50 @@ async fn handler(
 
         let has_tools = !tools.is_empty();
         let is_responses_api = is_responses_api;
-        // Phase 3: capture for detached feedback spawns in error arms below (no tuple bloat needed; closure captures persist across unfold steps)
-        let chat_id_for_fb = session_id.clone();
-        let token_for_fb = st.token.clone();
+        let chat_id_for_fb = Arc::new(session_id.clone());
+        let token_for_fb = Arc::new(st.token.clone());
+        let completion_id_arc = Arc::new(completion_id);
+        let model_arc = Arc::new(model);
+        struct StreamState {
+            rx: tokio::sync::mpsc::Receiver<Result<String, String>>,
+            full_text: AccumulatedText,
+            tool_emitted: bool,
+            content_emitted: bool,
+            done: bool,
+            prev_len: usize,
+            prev_thinking_len: usize,
+            thinking_role_sent: bool,
+            resp_created: bool,
+            output_started: bool,
+            item_id: String,
+        }
         let sse_stream = futures::stream::unfold(
-            (rx, String::new(), AccumulatedText::new(), false, false, false, 0usize, 0usize, false, false, false, String::new()),
-            move |(mut rx, buf, mut full_text, tool_emitted, mut content_emitted, done, mut prev_len, mut prev_thinking_len, mut thinking_role_sent, mut resp_created, mut output_started, mut item_id)| {
+            StreamState {
+                rx,
+                full_text: AccumulatedText::new(),
+                tool_emitted: false,
+                content_emitted: false,
+                done: false,
+                prev_len: 0usize,
+                prev_thinking_len: 0usize,
+                thinking_role_sent: false,
+                resp_created: false,
+                output_started: false,
+                item_id: String::new(),
+            },
+            move |mut st| {
                 let parent_store = parent_store.clone();
                 let tools = tools.clone();
                 let rf = rf.clone();
-                let completion_id = completion_id.clone();
-                let model = model.clone();
-                // Phase 3: clone the fb context *per unfold step* (FnMut requires non-move for reusable closure; async move consumes the step-local clones)
-                let chat_id_for_fb = chat_id_for_fb.clone();
-                let token_for_fb = token_for_fb.clone();
+                let completion_id = Arc::clone(&completion_id_arc);
+                let model = Arc::clone(&model_arc);
+                let chat_id_for_fb = Arc::clone(&chat_id_for_fb);
+                let token_for_fb = Arc::clone(&token_for_fb);
                 async move {
-                    if done {
+                    if st.done {
                         return None;
                     }
-                    match rx.recv().await {
+                    match st.rx.recv().await {
                         Some(Ok(line)) => {
                             // Track whether this chunk signals stream completion.
                             let mut stream_finished = false;
@@ -742,41 +803,41 @@ async fn handler(
                                     }
                                     if let Some(delta) = extract_qwen_sse_delta(&ch) {
                                         stream_finished = delta.finished;
-                                        full_text.append(&delta);
+                                        st.full_text.append(&delta);
                                     }
                                 }
                             }
                             let mut oai_chunks: Vec<String> = Vec::new();
-                            if is_responses_api && !resp_created {
-                                oai_chunks.push(serde_json::to_string(&serde_json::json!({
-                                    "type": "response.created",
-                                    "response": {
-                                        "id": completion_id,
-                                        "created_at": created,
-                                        "model": model,
-                                    }
-                                })).unwrap_or_default());
-                                resp_created = true;
+            if is_responses_api && !st.resp_created {
+                oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": completion_id,
+                        "created_at": created,
+                        "model": model,
+                    }
+                })).unwrap_or_default());
+                st.resp_created = true;
                             }
-                            let thinking = full_text.thinking();
-                            if thinking.len() > prev_thinking_len {
-                                let delta = &thinking[prev_thinking_len..];
-                                let first_thinking = !thinking_role_sent;
-                                oai_chunks.push(build_stream_chunk(
-                                    &completion_id, &model, created,
-                                    build_reasoning_delta(delta, first_thinking),
-                                    None,
-                                ));
-                                thinking_role_sent = true;
-                                prev_thinking_len = thinking.len();
+                let thinking = st.full_text.thinking();
+                if thinking.len() > st.prev_thinking_len {
+                    let delta = &thinking[st.prev_thinking_len..];
+                    let first_thinking = !st.thinking_role_sent;
+                    oai_chunks.push(build_stream_chunk(
+                        &completion_id, &model, created,
+                        build_reasoning_delta(delta, first_thinking),
+                        None,
+                    ));
+                    st.thinking_role_sent = true;
+                    st.prev_thinking_len = thinking.len();
                             }
                             // Fix #6: only run detect_tools on the finished delta to avoid
             // O(n²) scanning on every intermediate chunk.
                             // Phase 4: full_text accumulation (AccumulatedText) + terminal-only detect already provides
                             // complete payload for validate before any build_tool_call_stream_chunks or responses-api
                             // emission. No extra end-of-stream buffering required for name validation (tool JSON is atomic).
-                            if !tool_emitted && !content_emitted && stream_finished {
-                                let raw_tcs = detect_tools(full_text.full_answer(), &tools);
+            if !st.tool_emitted && !st.content_emitted && stream_finished {
+                let raw_tcs = detect_tools(st.full_text.full_answer(), &tools);
                                 let pid_for_gate = parent_store.lock().await.clone();
                                 let tcs = match tool_gate_stream(
                                     raw_tcs,
@@ -808,10 +869,10 @@ async fn handler(
                                         // Phase 3: spawn detached feedback (best-effort; client error sent immediately)
                                         let pid_for_fb = parent_store.lock().await.clone();
                                         let fb = build_tool_hallucination_feedback(&bad_names);
-                                        spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
-                                        info!(chat_id = %chat_id_for_fb, hallucinated = ?bad_names, "Phase 3 feedback spawned async (mid-stream)");
+                    spawn_feedback_if_hallucinated((*chat_id_for_fb).clone(), pid_for_fb, fb, (*token_for_fb).clone());
+                    info!(chat_id = %chat_id_for_fb, hallucinated = ?bad_names, "Phase 3 feedback spawned async (mid-stream)");
                                         let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
+                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: true, content_emitted: false, done: false, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: st.resp_created, output_started: st.output_started, item_id: st.item_id }));
                                     }
                                 };
                                 if !tcs.is_empty() {
@@ -826,20 +887,20 @@ async fn handler(
                                         let tid = format!("call_{}", uuid::Uuid::new_v4());
                                         let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
                                         if is_responses_api {
-                                            if !output_started {
-                                                oai_chunks.push(serde_json::to_string(&serde_json::json!({
-                                                    "type": "response.output_item.added",
-                                                    "output_index": i,
-                                                    "item": {
-                                                        "id": tid,
-                                                        "type": "function_call",
-                                                        "call_id": tid.clone(),
-                                                        "name": tc.name,
-                                                        "arguments": "",
-                                                    }
-                                                })).unwrap_or_default());
-                                                item_id = tid.clone();
-                                                output_started = true;
+                if !st.output_started {
+                    oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                        "type": "response.output_item.added",
+                        "output_index": i,
+                        "item": {
+                            "id": tid,
+                            "type": "function_call",
+                            "call_id": tid.clone(),
+                            "name": tc.name,
+                            "arguments": "",
+                        }
+                    })).unwrap_or_default());
+                    st.item_id = tid.clone();
+                    st.output_started = true;
                                             }
                                             oai_chunks.push(serde_json::to_string(&serde_json::json!({
                                                 "type": "response.function_call_arguments.delta",
@@ -853,29 +914,29 @@ async fn handler(
                                             }
                                         }
                                     }
-                                    let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, true, false, false, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
+            let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
+                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: true, content_emitted: false, done: false, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: st.resp_created, output_started: st.output_started, item_id: st.item_id }));
                                 }
-                                let answer = full_text.full_answer().to_string();
-                                let visible = client_visible_content(&answer, None, has_tools);
-                                if !visible.is_empty() {
-                                    content_emitted = true;
+            let answer = st.full_text.full_answer().to_string();
+            let visible = client_visible_content(&answer, None, has_tools);
+            if !visible.is_empty() {
+                st.content_emitted = true;
                                 }
                             }
-                            if !tool_emitted && (!has_tools || content_emitted) {
-                                let answer = full_text.full_answer().to_string();
+        if !st.tool_emitted && (!has_tools || st.content_emitted) {
+            let answer = st.full_text.full_answer().to_string();
                                 let visible = client_visible_content(&answer, None, has_tools);
                                 let visible = if rf.is_some() {
                                     strip_json_codeblock(&visible)
                                 } else {
                                     visible
                                 };
-                                if visible.len() > prev_len {
-                                    let delta = &visible[prev_len..];
-                                    if is_responses_api {
-                                        if !output_started {
-                                            let new_id = format!("msg_{}", uuid::Uuid::new_v4());
-                                            item_id = new_id.clone();
+            if visible.len() > st.prev_len {
+                let delta = &visible[st.prev_len..];
+                if is_responses_api {
+                    if !st.output_started {
+                        let new_id = format!("msg_{}", uuid::Uuid::new_v4());
+                        st.item_id = new_id.clone();
                                             oai_chunks.push(serde_json::to_string(&serde_json::json!({
                                                 "type": "response.output_item.added",
                                                 "output_index": 0,
@@ -885,16 +946,16 @@ async fn handler(
                                                     "role": "assistant",
                                                     "content": [{"type": "output_text", "text": "", "annotations": []}]
                                                 }
-                                            })).unwrap_or_default());
-                                            output_started = true;
+                    })).unwrap_or_default());
+                        st.output_started = true;
                                         }
-                                        oai_chunks.push(serde_json::to_string(&serde_json::json!({
-                                            "type": "response.output_text.delta",
-                                            "item_id": item_id,
-                                            "delta": delta,
-                                        })).unwrap_or_default());
-                                    } else {
-                                        if prev_len == 0 {
+                        oai_chunks.push(serde_json::to_string(&serde_json::json!({
+                            "type": "response.output_text.delta",
+                            "item_id": st.item_id,
+                            "delta": delta,
+                        })).unwrap_or_default());
+                    } else {
+                        if st.prev_len == 0 {
                                             oai_chunks.push(build_stream_chunk(
                                                 &completion_id, &model, created,
                                                 serde_json::json!({"role": "assistant", "content": delta.to_string()}),
@@ -908,16 +969,16 @@ async fn handler(
                                             ));
                                         }
                                     }
-                                    prev_len = visible.len();
-                                } else if visible.len() < prev_len {
-                                    prev_len = visible.len();
+                st.prev_len = visible.len();
+            } else if visible.len() < st.prev_len {
+                st.prev_len = visible.len();
                                 }
                             }
                             if !oai_chunks.is_empty() {
                                 let out = oai_chunks.iter().map(|s| format!("data: {}\n\n", s)).collect::<String>();
-                                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
+                                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(out))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: st.tool_emitted, content_emitted: st.content_emitted, done: false, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: st.resp_created, output_started: st.output_started, item_id: st.item_id }));
                             }
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), (rx, buf, full_text, tool_emitted, content_emitted, false, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(""))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: st.tool_emitted, content_emitted: st.content_emitted, done: false, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: st.resp_created, output_started: st.output_started, item_id: st.item_id }))
                         }
                         Some(Err(err_str)) => {
                             let err_chunk = format!(
@@ -927,123 +988,105 @@ async fn handler(
                                     Some("stop"),
                                 )
                             );
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)))
+                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(err_chunk))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: st.tool_emitted, content_emitted: st.content_emitted, done: true, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: st.resp_created, output_started: st.output_started, item_id: st.item_id }))
                         }
                         None => {   // all senders dropped (normal end or error path)
                             let mut final_chunks = String::new();
-                            if !tool_emitted && !content_emitted {
-                                let answer = full_text.full_answer().to_string();
+            if !st.tool_emitted && !st.content_emitted {
+                let answer = st.full_text.full_answer().to_string();
                                 if has_tools {
-                                    if let Some(err_msg) = detect_qwen_tool_error(&answer) {
-                                        error!(error = %err_msg, "Qwen returned tool error in stream");
-                                        let pid_for_recovery = parent_store.lock().await.clone();
-                                        let tool_name = extract_tool_name_from_error(&err_msg);
-                                        let ok_fb = build_synthetic_tool_ok_feedback_for_name(&tool_name);
-                                        match send_qwen_continuation_and_get_response(
-                                            &chat_id_for_fb,
-                                            pid_for_recovery.as_deref(),
-                                            &ok_fb,
-                                            &token_for_fb,
-                                        )
-                                        .await
-                                        {
-                                            Ok(r) => {
-                                                if let Some(new_pid) = r.new_parent_id {
-                                                    *parent_store.lock().await = Some(new_pid);
-                                                }
-                                                let txt = r.response_text;
-                                                if !txt.is_empty() {
-                                                    info!(
-                                                        chat_id = %chat_id_for_fb,
-                                                        error = %err_msg,
-                                                        tool_name = %tool_name,
-                                                        "Stream tool error recovery: emitting synthetic response"
-                                                    );
-                                                    let recovery_tokens = estimate_tokens(&txt);
-                                                    if is_responses_api {
-                                                        let mid = format!("msg_{}", uuid::Uuid::new_v4());
-                                                        final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
-                                                            "type": "response.output_item.added",
-                                                            "output_index": 0,
-                                                            "item": {
-                                                                "id": mid,
-                                                                "type": "message",
-                                                                "role": "assistant",
-                                                                "content": [{"type": "output_text", "text": "", "annotations": []}]
-                                                            }
-                                                        })).unwrap_or_default()));
-                                                        final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
-                                                            "type": "response.output_text.delta",
-                                                            "item_id": mid,
-                                                            "delta": txt,
-                                                        })).unwrap_or_default()));
-                                                        final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
-                                                            "type": "response.output_item.done",
-                                                            "output_index": 0,
-                                                            "item": {
-                                                                "id": mid,
-                                                                "type": "message",
-                                                                "role": "assistant",
-                                                                "content": [{"type": "output_text", "text": txt, "annotations": []}]
-                                                            }
-                                                        })).unwrap_or_default()));
-                                                        final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
-                                                            "type": "response.completed",
-                                                            "response": {
-                                                                "id": completion_id,
-                                                                "object": "response",
-                                                                "created_at": created,
-                                                                "model": model,
-                                                                "usage": {
-                                                                    "input_tokens": prompt_tokens,
-                                                                    "output_tokens": recovery_tokens,
-                                                                    "total_tokens": prompt_tokens + recovery_tokens,
-                                                                }
-                                                            }
-                                                        })).unwrap_or_default()));
-                                                    } else {
-                                                        final_chunks.push_str(&format!(
-                                                            "data: {}\n\n",
-                                                            build_stream_chunk(&completion_id, &model, created,
-                                                                serde_json::json!({"role": "assistant", "content": txt}),
-                                                                None,
-                                                            )
-                                                        ));
-                                                        final_chunks.push_str(&format!(
-                                                            "data: {}\n\n",
-                                                            build_stream_chunk(&completion_id, &model, created,
-                                                                serde_json::json!({}),
-                                                                Some("stop"),
-                                                            )
-                                                        ));
-                                                    }
-                                                    final_chunks.push_str("data: [DONE]\n\n");
-                                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, true, false, true, prev_len, prev_thinking_len, thinking_role_sent, true, true, String::new())));
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(error = %e, chat_id = %chat_id_for_fb, "Stream tool error recovery failed, falling back to error chunks");
-                                            }
-                                        }
-                                        // Fallback: original error behavior
-                                        if is_responses_api {
-                                            final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
-                                                "type": "error",
-                                                "error": {"message": err_msg, "type": "tool_error"},
-                                            })).unwrap_or_default()));
-                                        } else {
-                                            final_chunks.push_str(&format!(
-                                                "data: {}\n\n",
-                                                build_stream_chunk(&completion_id, &model, created,
-                                                    serde_json::json!({"content": format!("[Tool Error: {}]", err_msg)}),
-                                                    Some("stop"),
-                                                )
-                                            ));
-                                        }
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
+            if let Some(err_msg) = detect_qwen_tool_error(&answer) {
+                error!(error = %err_msg, "Qwen returned tool error in stream");
+                let pid_for_recovery = parent_store.lock().await.clone();
+                match tool_error_recovery(&chat_id_for_fb, pid_for_recovery.as_deref(), &token_for_fb, &err_msg).await {
+                    Ok(r) => {
+                        if let Some(new_pid) = r.new_parent_id {
+                            *parent_store.lock().await = Some(new_pid);
+                        }
+                        let txt = r.response_text;
+                        if !txt.is_empty() {
+                            info!(
+                                chat_id = %chat_id_for_fb,
+                                error = %err_msg,
+                                "Stream tool error recovery: emitting synthetic response"
+                            );
+                            let recovery_tokens = estimate_tokens(&txt);
+                            if is_responses_api {
+                                let mid = format!("msg_{}", uuid::Uuid::new_v4());
+                                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                    "type": "response.output_item.added",
+                                    "output_index": 0,
+                                    "item": {
+                                        "id": mid,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "", "annotations": []}]
                                     }
-                                }
-                                // Phase 4: full_text accumulation + terminal-only detect already provides complete payload
+                                })).unwrap_or_default()));
+                                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": mid,
+                                    "delta": txt,
+                                })).unwrap_or_default()));
+                                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                    "type": "response.output_item.done",
+                                    "output_index": 0,
+                                    "item": {
+                                        "id": mid,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": txt, "annotations": []}]
+                                    }
+                                })).unwrap_or_default()));
+                                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                    "type": "response.completed",
+                                    "response": {
+                                        "id": completion_id,
+                                        "object": "response",
+                                        "created_at": created,
+                                        "model": model,
+                                        "usage": {
+                                            "input_tokens": prompt_tokens,
+                                            "output_tokens": recovery_tokens,
+                                            "total_tokens": prompt_tokens + recovery_tokens,
+                                        }
+                                    }
+                                })).unwrap_or_default()));
+                            } else {
+                                final_chunks.push_str(&format!(
+                                    "data: {}\n\n",
+                                    build_stream_chunk(&completion_id, &model, created, serde_json::json!({"role": "assistant", "content": txt}), None,)
+                                ));
+                                final_chunks.push_str(&format!(
+                                    "data: {}\n\n",
+                                    build_stream_chunk(&completion_id, &model, created, serde_json::json!({}), Some("stop"),)
+                                ));
+                            }
+                            final_chunks.push_str("data: [DONE]\n\n");
+                            return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: true, content_emitted: false, done: true, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: true, output_started: true, item_id: String::new() }));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, chat_id = %chat_id_for_fb, "Stream tool error recovery failed, falling back to error chunks");
+                    }
+                }
+            // Fallback: unified error format with available_tools (matches non-stream path)
+            if is_responses_api {
+                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                    "type": "error",
+                    "error": {"message": err_msg, "type": "tool_error", "available_tools": tools},
+                })).unwrap_or_default()));
+            } else {
+                let err_json = construct_tool_error_upstream(&err_msg, &tools);
+                final_chunks.push_str(&format!(
+                    "data: {}\n\n",
+                    build_stream_chunk(&completion_id, &model, created, serde_json::json!({"content": err_json.to_string()}), Some("stop"),)
+                ));
+            }
+                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: st.tool_emitted, content_emitted: st.content_emitted, done: true, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: st.resp_created, output_started: st.output_started, item_id: st.item_id }));
+                }
+            }
+            // Phase 4: full_text accumulation + terminal-only detect already provides complete payload
                                 // for validate before emission. No extra buffering required (see mid-stream comment).
                                 let raw_tcs = detect_tools(&answer, &tools);
                                 let pid_for_gate = parent_store.lock().await.clone();
@@ -1077,11 +1120,11 @@ async fn handler(
                                             ));
                                         }
                                         // Phase 3: spawn detached feedback (stream-end validate err path)
-                                        let pid_for_fb = parent_store.lock().await.clone();
-                                        let fb = build_tool_hallucination_feedback(&bad_names);
-                                        spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
-                                        info!(chat_id = %chat_id_for_fb, hallucinated = ?bad_names, "Phase 3 feedback spawned async (stream-end)");
-                                        return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
+                    let pid_for_fb = parent_store.lock().await.clone();
+                    let fb = build_tool_hallucination_feedback(&bad_names);
+                    spawn_feedback_if_hallucinated((*chat_id_for_fb).clone(), pid_for_fb, fb, (*token_for_fb).clone());
+                info!(chat_id = %chat_id_for_fb, hallucinated = ?bad_names, "Phase 3 feedback spawned async (stream-end)");
+                return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: st.tool_emitted, content_emitted: st.content_emitted, done: true, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: st.resp_created, output_started: st.output_started, item_id: st.item_id }));
                                     }
                                 };
                                 if !tcs.is_empty() {
@@ -1096,7 +1139,7 @@ async fn handler(
                                             info!(tool = %tc.name, index = i, "Detected tool call at stream end");
                                             let tid = format!("call_{}", uuid::Uuid::new_v4());
                                             let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
-                                            if !output_started {
+                                            if !st.output_started {
                                                 final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
                                                     "type": "response.output_item.added",
                                                     "output_index": i,
@@ -1108,7 +1151,7 @@ async fn handler(
                                                         "arguments": args,
                                                     }
                                                 })).unwrap_or_default()));
-                                                output_started = true;
+                        st.output_started = true;
                                             }
                                         }
                                     } else {
@@ -1155,19 +1198,19 @@ async fn handler(
                                 }
                             }
                             if is_responses_api {
-                                if output_started && !tool_emitted {
-                                    final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
-                                        "type": "response.output_item.done",
-                                        "output_index": 0,
-                                        "item": {
-                                            "id": item_id,
-                                            "type": "message",
-                                            "role": "assistant",
-                                            "content": [{"type": "output_text", "text": client_visible_content(full_text.full_answer(), None, has_tools), "annotations": []}]
-                                        }
-                                    })).unwrap_or_default()));
-                                }
-                                let resp_completion_tokens = estimate_tokens(full_text.full_answer());
+            if st.output_started && !st.tool_emitted {
+                final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": st.item_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": client_visible_content(st.full_text.full_answer(), None, has_tools), "annotations": []}]
+                    }
+                })).unwrap_or_default()));
+            }
+            let resp_completion_tokens = estimate_tokens(st.full_text.full_answer());
                                 final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
                                     "type": "response.completed",
                                     "response": {
@@ -1182,27 +1225,27 @@ async fn handler(
                                         }
                                     }
                                 })).unwrap_or_default()));
-                            } else {
-                                if tool_emitted {
-                                    final_chunks.push_str(&format!(
-                                        "data: {}\n\n",
-                                        build_stream_chunk(&completion_id, &model, created,
-                                            serde_json::json!({}),
-                                            Some("tool_calls"),
-                                        )
-                                    ));
-                                } else if content_emitted {
-                                    final_chunks.push_str(&format!(
-                                        "data: {}\n\n",
-                                        build_stream_chunk(&completion_id, &model, created,
-                                            serde_json::json!({}),
-                                            Some("stop"),
-                                        )
-                                    ));
-                                }
-                            }
-                            final_chunks.push_str("data: [DONE]\n\n");
-                            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)))
+        } else {
+            if st.tool_emitted {
+                final_chunks.push_str(&format!(
+                    "data: {}\n\n",
+                    build_stream_chunk(&completion_id, &model, created,
+                        serde_json::json!({}),
+                        Some("tool_calls"),
+                    )
+                ));
+            } else if st.content_emitted {
+                final_chunks.push_str(&format!(
+                    "data: {}\n\n",
+                    build_stream_chunk(&completion_id, &model, created,
+                        serde_json::json!({}),
+                        Some("stop"),
+                    )
+                ));
+            }
+        }
+        final_chunks.push_str("data: [DONE]\n\n");
+        Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), StreamState { rx: st.rx, full_text: st.full_text, tool_emitted: st.tool_emitted, content_emitted: st.content_emitted, done: true, prev_len: st.prev_len, prev_thinking_len: st.prev_thinking_len, thinking_role_sent: st.thinking_role_sent, resp_created: st.resp_created, output_started: st.output_started, item_id: st.item_id }))
                         }
                     }
                 }
@@ -1390,80 +1433,62 @@ async fn handler(
                 }
 
                 if !full_text.is_empty() && !tools.is_empty() {
-                    if let Some(err_msg) = detect_qwen_tool_error(&full_text) {
-                        error!(error = %err_msg, "Qwen returned tool error in response text");
-                        let tool_name = extract_tool_name_from_error(&err_msg);
-                        let ok_fb = build_synthetic_tool_ok_feedback_for_name(&tool_name);
-                        if let Some(pid) = &latest_pid {
-                            match send_qwen_continuation_and_get_response(
-                                &session_id,
-                                Some(pid),
-                                &ok_fb,
-                                &st.token,
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    if let Some(new_pid) = result.new_parent_id {
-                                        session.set_parent_id(new_pid.clone()).await;
-                                        info!(
-                                            chat_id = %session_id,
-                                            new_parent = %new_pid,
-                                            error = %err_msg,
-                                            tool_name = %tool_name,
-                                            "Tool error recovery: synthetic OK injected, new response obtained"
-                                        );
-                                    } else {
-                                        info!(
-                                            chat_id = %session_id,
-                                            error = %err_msg,
-                                            "Tool error recovery: synthetic OK injected (no new_pid)"
-                                        );
-                                    }
-                                    let new_text = result.response_text;
-                                    if !new_text.is_empty() {
-                                        let new_tokens = estimate_tokens(&new_text);
-                                        let total = prompt_tokens + new_tokens;
-                                        let resp_value = serde_json::json!({
-                                            "id": completion_id,
-                                            "object": "chat.completion",
-                                            "created": created,
-                                            "model": model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "message": {
-                                                    "role": "assistant",
-                                                    "content": new_text,
-                                                },
-                                                "finish_reason": "stop"
-                                            }],
-                                            "usage": {
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": new_tokens,
-                                                "total_tokens": total
-                                            }
-                                        });
-                                        return Ok(json_response(StatusCode::OK, &resp_value)
-                                            .map(box_body));
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, chat_id = %session_id, "Tool error recovery failed, falling back to error response");
-                                }
+        if let Some(err_msg) = detect_qwen_tool_error(&full_text) {
+            error!(error = %err_msg, "Qwen returned tool error in response text");
+            match tool_error_recovery(&session_id, latest_pid.as_deref(), &st.token, &err_msg).await {
+                Ok(result) => {
+                    if let Some(new_pid) = result.new_parent_id {
+                        session.set_parent_id(new_pid.clone()).await;
+                        info!(
+                            chat_id = %session_id,
+                            new_parent = %new_pid,
+                            error = %err_msg,
+                            "Tool error recovery: synthetic OK injected, new response obtained"
+                        );
+                    } else {
+                        info!(
+                            chat_id = %session_id,
+                            error = %err_msg,
+                            "Tool error recovery: synthetic OK injected (no new_pid)"
+                        );
+                    }
+                    let new_text = result.response_text;
+                    if !new_text.is_empty() {
+                        let new_tokens = estimate_tokens(&new_text);
+                        let total = prompt_tokens + new_tokens;
+                        let resp_value = serde_json::json!({
+                            "id": completion_id,
+                            "object": "chat.completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": new_text,
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": new_tokens,
+                                "total_tokens": total
                             }
-                        } else {
-                            warn!(chat_id = %session_id, "No latest_pid for tool error recovery; returning error");
-                        }
-                        let mut err = serde_json::json!({
-                            "message": err_msg,
-                            "type": "invalid_request_error",
                         });
-                        err["available_tools"] = serde_json::json!(tools);
-                        return Ok(json_response(
-                            StatusCode::BAD_REQUEST,
-                            &serde_json::json!({"error": err}),
-                        )
-                        .map(box_body));
+                        return Ok(json_response(StatusCode::OK, &resp_value)
+                            .map(box_body));
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, chat_id = %session_id, "Tool error recovery failed, falling back to error response");
+                }
+            }
+            let err_json = construct_tool_error_upstream(&err_msg, &tools);
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &err_json,
+            )
+            .map(box_body));
                     }
                 }
 
@@ -1638,42 +1663,13 @@ async fn handler(
     }
 }
 
-async fn embeddings_handler(req: Request<Incoming>) -> Result<Response<BoxBody>, Infallible> {
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return Ok(bad_request(format!("Failed to read body: {}", e)).map(box_body));
-        }
-    };
-
-    let v: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(box_body));
-        }
-    };
-
-    let input = v.get("input").and_then(|i| i.as_str()).unwrap_or("");
-    let dims = v.get("dimensions").and_then(|d| d.as_u64()).unwrap_or(1536) as usize;
-    let embedding: Vec<f64> = vec![0.0; dims];
-    let tokens = std::cmp::max(1, input.len() / 4);
-    let model = request_model(&v);
-
-    Ok(json_response(
-        StatusCode::OK,
-        &serde_json::json!({
-            "object": "list",
-            "data": [{
-                "object": "embedding",
-                "embedding": embedding,
-                "index": 0
-            }],
-            "model": model,
-            "usage": {
-                "prompt_tokens": tokens,
-                "total_tokens": tokens
-            }
-        }),
+async fn embeddings_handler(_req: Request<Incoming>) -> Result<Response<BoxBody>, Infallible> {
+    Ok(openai_error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "Embeddings are not supported by this proxy",
+        "not_supported",
+        None,
+        None,
     )
     .map(box_body))
 }
@@ -1724,7 +1720,7 @@ async fn router(
         (Method::POST, "/v1/embeddings") => embeddings_handler(req).await.unwrap(),
         (Method::GET, "/") | (Method::GET, "") => json_response(
             StatusCode::OK,
-            &serde_json::json!({"message": "Qwen OpenAI Proxy (smol+hyper)", "version": "0.1.0"}),
+            &serde_json::json!({"message": "Qwen OpenAI Proxy (tokio+hyper)", "version": "0.1.0"}),
         )
         .map(box_body),
         _ => {

@@ -1,0 +1,92 @@
+name: Build Ring for Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RING_VERSION: "0.17.14"
+
+jobs:
+  build-ring-android:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install Android NDK
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r26d
+        add-to-path: false
+
+    - name: Configure Android linker
+      run: |
+        NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
+        TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+        echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android30-clang" >> $GITHUB_ENV
+        echo "CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android30-clang" >> $GITHUB_ENV
+        echo "AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
+
+    - name: Build ring
+      run: |
+        cargo build --release --target aarch64-linux-android -p ring
+
+    - name: Find and copy libring_core.a
+      run: |
+        RING_LIB=$(find target/aarch64-linux-android/release/build -name 'libring_core*.a' | head -1)
+        echo "Found: $RING_LIB"
+        mkdir -p prebuilt
+        cp "$RING_LIB" prebuilt/libring_core_0_17_14.a
+        ls -la prebuilt/
+
+    - name: Upload prebuilt ring library
+      uses: actions/upload-artifact@v4
+      with:
+        name: ring-prebuilt-aarch64-linux-android
+        path: prebuilt/libring_core_0_17_14.a
+
+  build-full-android:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install Android NDK
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r26d
+        add-to-path: false
+
+    - name: Configure Android linker
+      run: |
+        NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
+        TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+        echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android30-clang" >> $GITHUB_ENV
+        echo "CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android30-clang" >> $GITHUB_ENV
+        echo "AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
+
+    - name: Build full release
+      run: cargo build --release --target aarch64-linux-android
+
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: qwen-proxy-aarch64-linux-android
+        path: target/aarch64-linux-android/release/qwen-proxy
