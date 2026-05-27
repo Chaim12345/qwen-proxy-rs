@@ -782,8 +782,8 @@ async fn handler(
                                         tool_names = ?tcs.iter().map(|t| &t.name).collect::<Vec<_>>(),
                                         "Streaming: emitting validated tool calls to client (Phase 2 hard gate passed)"
                                     );
-                                    for (i, tc) in tcs.iter().enumerate() {
-                                        info!(tool = %tc.name, index = i, "Detected tool call");
+                                    for (i, tc) in tcs.iter().take(1).enumerate() {
+                                        info!(tool = %tc.name, index = i, "Detected tool call (1 at a time)");
                                         let tid = format!("call_{}", uuid::Uuid::new_v4());
                                         let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
                                         if is_responses_api {
@@ -1257,10 +1257,22 @@ async fn handler(
                     }
                 }
 
-                if full_text.is_empty() && !tools.is_empty() {
-                    // Phase 4.1 / 3.4: close the raw-body bypass (was detect + direct emit with zero validate).
-                    // Now uniform hard gate + feedback like the other 3 emission sites. Unknown names *never* leak.
-                    let raw_tcs = detect_tools(&body_text, &tools);
+if full_text.is_empty() && !tools.is_empty() {
+        // Check for Qwen tool errors in the raw body even when accumulated answer is empty
+        // (e.g., all text was in a non-answer phase or the error is in the SSE metadata).
+        if let Some(err_msg) = detect_qwen_tool_error(&body_text) {
+            error!(error = %err_msg, "Qwen returned tool error in raw body (empty full_text)");
+            let mut err = serde_json::json!({
+                "message": err_msg,
+                "type": "invalid_request_error",
+            });
+            err["available_tools"] = serde_json::json!(tools);
+            return Ok(json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": err}))
+                .map(|b| box_body(b)));
+        }
+        // Phase 4.1 / 3.4: close the raw-body bypass (was detect + direct emit with zero validate).
+        // Now uniform hard gate + feedback like the other 3 emission sites. Unknown names *never* leak.
+        let raw_tcs = detect_tools(&body_text, &tools);
                     let tcs = match tool_gate_nonstream(
                         raw_tcs,
                         &tools,
@@ -1316,9 +1328,10 @@ async fn handler(
                     if !tcs.is_empty() {
                         let tool_calls: Vec<serde_json::Value> = tcs
                             .iter()
+                            .take(1)
                             .enumerate()
                             .map(|(i, tc)| {
-                                info!(tool = %tc.name, index = i, "Detected tool call in raw body");
+                                info!(tool = %tc.name, index = i, "Detected tool call in raw body (1 at a time)");
                                 let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
                                 let args = serde_json::to_string(&tc.args)
                                     .unwrap_or_else(|_| "{}".to_string());
@@ -1514,9 +1527,10 @@ async fn handler(
                 let resp_value = if !tcs.is_empty() {
                     let tool_calls: Vec<serde_json::Value> = tcs
                         .iter()
+                        .take(1)
                         .enumerate()
                         .map(|(i, tc)| {
-                            info!(tool = %tc.name, index = i, "Detected tool call");
+                            info!(tool = %tc.name, index = i, "Detected tool call (1 at a time)");
                             let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
                             let args = serde_json::to_string(&tc.args)
                                 .unwrap_or_else(|_| "{}".to_string());
@@ -1533,7 +1547,7 @@ async fn handler(
                         .collect();
 
                     if is_responses_api {
-                        let output: Vec<serde_json::Value> = tcs.iter().map(|tc| {
+                        let output: Vec<serde_json::Value> = tcs.iter().take(1).map(|tc| {
                             serde_json::json!({
                                 "type": "function_call",
                                 "id": format!("call_{}", uuid::Uuid::new_v4()),
