@@ -682,8 +682,8 @@ pub fn truncate_for_context_limit(v: &mut Value, max_chars: usize) -> bool {
             .count();
         let recent_count = std::cmp::min(20, msgs.len().saturating_sub(system_count));
         let recent_start = msgs.len().saturating_sub(recent_count);
-    let system_msgs: Vec<Value> = msgs[..system_count].to_vec();
-    let recent_msgs: Vec<Value> = msgs[recent_start..].to_vec();
+        let system_msgs: Vec<Value> = msgs[..system_count].to_vec();
+        let recent_msgs: Vec<Value> = msgs[recent_start..].to_vec();
         let mut merged: Vec<Value> = Vec::with_capacity(system_msgs.len() + recent_msgs.len());
         merged.extend(system_msgs);
         merged.extend(recent_msgs);
