@@ -92,14 +92,13 @@ impl SessionManager {
     pub async fn acquire(&self, client_key: &str, token: &str) -> Result<AcquiredSession> {
         let now = now_millis();
         let last = self.last_cleanup_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last) > 60_000 {
-            if self
+        if now.saturating_sub(last) > 60_000
+            && self
                 .last_cleanup_ms
                 .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
-            {
-                self.cleanup_expired();
-            }
+        {
+            self.cleanup_expired();
         }
 
         if self.sessions.len() >= max_sessions() {

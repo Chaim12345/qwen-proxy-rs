@@ -537,11 +537,9 @@ fn parse_qwen_sse_line(line: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed == "[DONE]" {
         return None;
     }
-    if let Some(rest) = trimmed.strip_prefix("data: ") {
-        Some(rest.trim().to_string())
-    } else {
-        None
-    }
+    trimmed
+        .strip_prefix("data: ")
+        .map(|rest| rest.trim().to_string())
 }
 
 fn qwen_request_headers(token: &str) -> Vec<(String, String)> {
@@ -1237,7 +1235,7 @@ async fn handler(
                 req = req.set(k.as_str(), v.as_str());
             }
             req = req.set("accept", "text/event-stream");
-            match req.send_bytes(&*body_arc2) {
+            match req.send_bytes(&body_arc2) {
                 Ok(resp) => {
                     let status = resp.status();
                     let body_text = resp.into_string().unwrap_or_default();
@@ -1248,7 +1246,7 @@ async fn handler(
         })
         .await
         .map_err(|e| format!("spawn_blocking join error: {}", e))
-        .unwrap_or_else(|e| Err(e));
+        .unwrap_or_else(Err);
 
         match http_res {
             Ok((status, body_text)) => {
