@@ -573,7 +573,7 @@ async fn handler(
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| box_body(b)));
+            return Ok(bad_request(format!("Failed to read body: {}", e)).map(box_body));
         }
     };
 
@@ -582,7 +582,7 @@ async fn handler(
     let v: serde_json::Value = match serde_json::from_slice(&json_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| box_body(b)));
+            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(box_body));
         }
     };
 
@@ -591,11 +591,11 @@ async fn handler(
     } else if let Some(input) = v.get("input").and_then(|m| m.as_array()) {
         input
     } else {
-        return Ok(bad_request("messages or input array is required").map(|b| box_body(b)));
+        return Ok(bad_request("messages or input array is required").map(box_body));
     };
 
     if messages.is_empty() {
-        return Ok(bad_request("messages array cannot be empty").map(|b| box_body(b)));
+        return Ok(bad_request("messages array cannot be empty").map(box_body));
     }
 
     let is_responses_api = v.get("input").is_some() && v.get("messages").is_none();
@@ -631,7 +631,7 @@ async fn handler(
             };
             return Ok(
                 openai_error_response(status, e.to_string(), "server_error", None, None)
-                    .map(|b| box_body(b)),
+                    .map(box_body),
             );
         }
     };
@@ -1259,10 +1259,10 @@ async fn handler(
                         return Ok(internal_error(
                             "Qwen chat is busy (another message in flight on this chat_id)",
                         )
-                        .map(|b| box_body(b)));
+                        .map(box_body));
                     }
                     return Ok(internal_error(format!("Qwen API returned {}", status))
-                        .map(|b| box_body(b)));
+                        .map(box_body));
                 }
                 // body_text now from blocking ureq; proceed with original line processing (includes set_parent_id awaits)
                 let mut acc = AccumulatedText::new();
@@ -1294,7 +1294,7 @@ async fn handler(
                             None,
                             Some("rate_limit"),
                         )
-                        .map(|b| box_body(b)));
+                        .map(box_body));
                     }
                 }
 
@@ -1312,7 +1312,7 @@ async fn handler(
                             StatusCode::BAD_REQUEST,
                             &serde_json::json!({"error": err}),
                         )
-                        .map(|b| box_body(b)));
+                        .map(box_body));
                     }
                     // Phase 4.1 / 3.4: close the raw-body bypass (was detect + direct emit with zero validate).
                     // Now uniform hard gate + feedback like the other 3 emission sites. Unknown names *never* leak.
@@ -1339,7 +1339,7 @@ async fn handler(
                                 "Phase 4.1 raw-body",
                             )
                             .await
-                            .map(|b| box_body(b)));
+                            .map(box_body));
                         }
                     };
                     if !tcs.is_empty() {
@@ -1387,7 +1387,7 @@ async fn handler(
                             count = tcs.len(),
                             "Returning tool calls from raw body (validated Phase 4.1)"
                         );
-                        return Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)));
+                        return Ok(json_response(StatusCode::OK, &resp_value).map(box_body));
                     }
                 }
 
@@ -1446,7 +1446,7 @@ async fn handler(
                                             }
                                         });
                                         return Ok(json_response(StatusCode::OK, &resp_value)
-                                            .map(|b| box_body(b)));
+                                            .map(box_body));
                                     }
                                 }
                                 Err(e) => {
@@ -1465,7 +1465,7 @@ async fn handler(
                             StatusCode::BAD_REQUEST,
                             &serde_json::json!({"error": err}),
                         )
-                        .map(|b| box_body(b)));
+                        .map(box_body));
                     }
                 }
 
@@ -1492,7 +1492,7 @@ async fn handler(
                             "non-stream",
                         )
                         .await
-                        .map(|b| box_body(b)));
+                        .map(box_body));
                     }
                 };
 
@@ -1585,7 +1585,7 @@ async fn handler(
                                     None,
                                     None,
                                 )
-                                .map(|b| box_body(b)));
+                                .map(box_body));
                             }
                         };
                     info!(len = visible.len(), "Returning text response");
@@ -1631,11 +1631,11 @@ async fn handler(
                     }
                 };
 
-                Ok(json_response(StatusCode::OK, &resp_value).map(|b| box_body(b)))
+                Ok(json_response(StatusCode::OK, &resp_value).map(box_body))
             }
             Err(e) => {
                 error!(error = %e, "Qwen API call failed (unblock)");
-                Ok(internal_error(format!("Qwen API error: {}", e)).map(|b| box_body(b)))
+                Ok(internal_error(format!("Qwen API error: {}", e)).map(box_body))
             }
         }
     }
@@ -1645,14 +1645,14 @@ async fn embeddings_handler(req: Request<Incoming>) -> Result<Response<BoxBody>,
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            return Ok(bad_request(format!("Failed to read body: {}", e)).map(|b| box_body(b)));
+            return Ok(bad_request(format!("Failed to read body: {}", e)).map(box_body));
         }
     };
 
     let v: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(|b| box_body(b)));
+            return Ok(bad_request(format!("Invalid JSON: {}", e)).map(box_body));
         }
     };
 
@@ -1678,7 +1678,7 @@ async fn embeddings_handler(req: Request<Incoming>) -> Result<Response<BoxBody>,
             }
         }),
     )
-    .map(|b| box_body(b)))
+    .map(box_body))
 }
 
 async fn router(
@@ -1715,11 +1715,11 @@ async fn router(
     }
 
     let resp = match (method.clone(), path.as_str()) {
-        (Method::GET, "/health") => health_handler().map(|b| box_body(b)),
-        (Method::GET, "/v1/models") => models_handler().map(|b| box_body(b)),
+        (Method::GET, "/health") => health_handler().map(box_body),
+        (Method::GET, "/v1/models") => models_handler().map(box_body),
         (Method::GET, p) if p.starts_with("/v1/models/") => {
             let model_id = p.trim_start_matches("/v1/models/");
-            model_handler(model_id).map(|b| box_body(b))
+            model_handler(model_id).map(box_body)
         }
         (Method::POST, "/v1/chat/completions") | (Method::POST, "/v1/responses") => {
             handler(req, st).await.unwrap()
@@ -1729,12 +1729,12 @@ async fn router(
             StatusCode::OK,
             &serde_json::json!({"message": "Qwen OpenAI Proxy (smol+hyper)", "version": "0.1.0"}),
         )
-        .map(|b| box_body(b)),
+        .map(box_body),
         _ => {
             if method == Method::POST {
                 handler(req, st).await.unwrap()
             } else {
-                not_found_response().map(|b| box_body(b))
+                not_found_response().map(box_body)
             }
         }
     };
