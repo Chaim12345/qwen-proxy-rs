@@ -531,6 +531,101 @@ pub async fn send_qwen_chat_continuation(
     .map_err(|e| ::anyhow::anyhow!("spawn_blocking join error for feedback: {}", e))?
 }
 
+/// Result of a continuation request that includes the model's response text.
+pub struct ContinuationResponse {
+    pub new_parent_id: Option<String>,
+    pub response_text: String,
+}
+
+/// Send feedback continuation to Qwen and extract both the new parent_id AND the model's response text.
+/// Used by the tool-error recovery path: when Qwen says "Tool X does not exist", we inject a user
+/// message telling it to pretend the tool exists, then return the corrected response to the client.
+/// 60s timeout. Consistent ureq + spawn_blocking pattern (see send_qwen_chat_continuation).
+pub async fn send_qwen_continuation_and_get_response(
+    chat_id: &str,
+    parent_id: Option<&str>,
+    feedback_content: &str,
+    token: &str,
+) -> ::anyhow::Result<ContinuationResponse> {
+    let chat_id = chat_id.to_string();
+    let parent = parent_id.map(|s| s.to_string());
+    let feedback = feedback_content.to_string();
+    let token = token.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let upstream = crate::constants::qwen_upstream_model(None);
+        let payload = qwen_payload(&chat_id, parent.as_deref(), &feedback, &upstream);
+        let url = format!(
+            "{}/chat/completions?chat_id={}",
+            crate::constants::QWEN_API_BASE,
+            chat_id
+        );
+
+        let req = ureq::post(&url)
+            .timeout(std::time::Duration::from_secs(60))
+            .set("accept", "text/event-stream")
+            .set("content-type", "application/json")
+            .set("referer", "https://chat.qwen.ai/")
+            .set("source", "web")
+            .set("version", "0.8.0")
+            .set("cookie", &format!("token={}", token));
+
+        let resp = req
+            .send_json(&payload)
+            .map_err(|e| ::anyhow::anyhow!("Continuation POST failed: {}", e))?;
+
+        if resp.status() == 401 {
+            return Err(::anyhow::anyhow!("Qwen token expired"));
+        }
+        if !(200..300).contains(&resp.status()) {
+            return Err(::anyhow::anyhow!("Qwen returned status {}", resp.status()));
+        }
+
+        let body_text = resp.into_string().unwrap_or_default();
+
+        let mut new_pid: Option<String> = None;
+        let mut acc = AccumulatedText::new();
+
+        for line in body_text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "[DONE]" {
+                continue;
+            }
+            let data = if let Some(rest) = trimmed.strip_prefix("data: ") {
+                rest.trim()
+            } else {
+                trimmed
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Ok(ch) = serde_json::from_str::<Value>(data) {
+                if new_pid.is_none() {
+                    if let Some(pid) = extract_response_parent_id(&ch) {
+                        new_pid = Some(pid);
+                    }
+                }
+                if let Some(delta) = extract_qwen_sse_delta(&ch) {
+                    acc.append(&delta);
+                }
+            }
+        }
+
+        if new_pid.is_none() {
+            if let Ok(v) = serde_json::from_str::<Value>(&body_text) {
+                new_pid = extract_response_parent_id(&v);
+            }
+        }
+
+        Ok(ContinuationResponse {
+            new_parent_id: new_pid,
+            response_text: acc.full_answer().to_string(),
+        })
+    })
+    .await
+    .map_err(|e| ::anyhow::anyhow!("spawn_blocking join error: {}", e))?
+}
+
 fn message_content_to_string(content: &Value) -> String {
     if let Some(text) = content.as_str() {
         return text.to_string();
@@ -918,9 +1013,8 @@ pub fn validate_tool_calls_with_flags(
 
 /// Detect tool calls in text using multiple strategies.
 /// Strategies are tried in order of cost; early returns avoid redundant work (#11).
-/// Layer 4 (Phase 4.2): accept_tool_call (called by all strategies) now integrates
-/// normalize_tool_name + is_tool_name_allowed so prefixed names (get_*, bash_* etc.) are
-/// forgiven early and canonical name emitted. validate_tool_calls is the final choke.
+/// Returns raw parsed ToolCalls — validation/approval is done by validate_tool_calls.
+/// This avoids double-applying accept logic which caused duplicate emission under TOOL_PASS_THROUGH.
 pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     let normalized = normalize_tool_call_text(text);
     let tool_names: Vec<&str> = tool_defs
@@ -941,13 +1035,10 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     let mut used_codeblock_path = false;
 
     // Strategy 1: markdown code blocks (cheapest — one regex pass)
-    // (Layer 4 norm happens inside accept_tool_call for all strategies)
     for cap in MARKDOWN_CODE_RE.captures_iter(&normalized) {
         let json_str = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        if let Some(tc) =
-            try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names))
-        {
-            debug!(strategy = "markdown_code_block", tool = %tc.name, "Tool detected");
+        if let Some(tc) = try_parse_tool_json(json_str) {
+            debug!(strategy = "markdown_code_block", tool = %tc.name, "Tool detected (raw)");
             used_codeblock_path = true;
             if !found.contains(&tc) {
                 found.push(tc);
@@ -960,7 +1051,6 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
             client_tool_count,
             detected_count = found.len(),
             used_codeblock_path,
-            hallucinated_tool_names = ?Vec::<String>::new(),
             "Tool detection complete (markdown fast-path)"
         );
         return found;
@@ -969,10 +1059,8 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
     // Strategy 2: scan for JSON objects that explicitly contain "tool" key
     let blocks = extract_json_blocks(&normalized);
     for json_str in blocks.iter().filter(|b| b.contains("\"tool\"")) {
-        if let Some(tc) =
-            try_parse_tool_json(json_str).and_then(|tc| accept_tool_call(tc, &tool_names))
-        {
-            debug!(strategy = "json_object_scan", tool = %tc.name, "Tool detected");
+        if let Some(tc) = try_parse_tool_json(json_str) {
+            debug!(strategy = "json_object_scan", tool = %tc.name, "Tool detected (raw)");
             if !found.contains(&tc) {
                 found.push(tc);
             }
@@ -984,7 +1072,6 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
             client_tool_count,
             detected_count = found.len(),
             used_codeblock_path,
-            hallucinated_tool_names = ?Vec::<String>::new(),
             "Tool detection complete (json scan)"
         );
         return found;
@@ -997,10 +1084,8 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
             if let Some(start) = trimmed.find('{') {
                 if let Some(end) = find_json_object_end(trimmed, start) {
                     let json_str = &trimmed[start..=end];
-                    if let Some(tc) = try_parse_tool_json(json_str)
-                        .and_then(|tc| accept_tool_call(tc, &tool_names))
-                    {
-                        debug!(strategy = "line_scan", tool = %tc.name, "Tool detected");
+                    if let Some(tc) = try_parse_tool_json(json_str) {
+                        debug!(strategy = "line_scan", tool = %tc.name, "Tool detected (raw)");
                         if !found.contains(&tc) {
                             found.push(tc);
                         }
@@ -1010,21 +1095,19 @@ pub fn detect_tools(text: &str, tool_defs: &[Value]) -> Vec<ToolCall> {
         }
     }
 
-    let hallucinated: Vec<String> = vec![]; // Phase 0 baseline (strict filtering comes in Phase 2)
     if found.is_empty() {
         debug!(client_tool_count, "No tool call detected in text");
     } else {
         debug!(
             count = found.len(),
-            client_tool_count, "Tool calls detected"
+            client_tool_count, "Tool calls detected (raw, pending validation)"
         );
     }
     info!(
         client_tool_count,
         detected_count = found.len(),
         used_codeblock_path,
-        hallucinated_tool_names = ?hallucinated,
-        "Tool detection complete"
+        "Tool detection complete (raw)"
     );
     found
 }

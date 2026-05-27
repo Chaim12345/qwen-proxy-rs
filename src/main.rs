@@ -323,11 +323,23 @@ fn build_tool_hallucination_feedback(bad_names: &[String]) -> String {
     )
 }
 
-fn build_qwen_tool_error_feedback(err_msg: &str) -> String {
-    format!(
-        "TOOL RESULT: ERROR: Qwen reported tool error: {}. Only use exact names from the list the client provided. Retry with a valid tool or respond in plain text without a tool call.",
-        err_msg
-    )
+fn extract_tool_name_from_error(err_msg: &str) -> String {
+    if let Some(rest) = err_msg.strip_prefix("Tool ") {
+        for suffix in &[" does not exist", " does not exists"] {
+            if let Some(pos) = rest.find(suffix) {
+                return rest[..pos].to_string();
+            }
+        }
+    }
+    err_msg
+        .split(&[' ', '.'][..])
+        .find(|w| !w.is_empty() && !["Tool", "does", "not", "exist", "exists"].contains(w))
+        .unwrap_or("unknown_tool")
+        .to_string()
+}
+
+fn build_synthetic_tool_ok_feedback_for_name(_tool_name: &str) -> String {
+    "ok pretend it does exist and call it properly anyway".to_string()
 }
 
 /// Run validate_tool_calls; on synthetic-ok feedback, spawn best-effort Qwen continuation.
@@ -885,6 +897,96 @@ async fn handler(
                                 if has_tools {
                                     if let Some(err_msg) = detect_qwen_tool_error(&answer) {
                                         error!(error = %err_msg, "Qwen returned tool error in stream");
+                                        let pid_for_recovery = parent_store.lock().await.clone();
+                                        let tool_name = extract_tool_name_from_error(&err_msg);
+                                        let ok_fb = build_synthetic_tool_ok_feedback_for_name(&tool_name);
+                                        match send_qwen_continuation_and_get_response(
+                                            &chat_id_for_fb,
+                                            pid_for_recovery.as_deref(),
+                                            &ok_fb,
+                                            &token_for_fb,
+                                        )
+                                        .await
+                                        {
+                                            Ok(r) => {
+                                                if let Some(new_pid) = r.new_parent_id {
+                                                    *parent_store.lock().await = Some(new_pid);
+                                                }
+                                                let txt = r.response_text;
+                                                if !txt.is_empty() {
+                                                    info!(
+                                                        chat_id = %chat_id_for_fb,
+                                                        error = %err_msg,
+                                                        tool_name = %tool_name,
+                                                        "Stream tool error recovery: emitting synthetic response"
+                                                    );
+                                                    let recovery_tokens = estimate_tokens(&txt);
+                                                    if is_responses_api {
+                                                        let mid = format!("msg_{}", uuid::Uuid::new_v4());
+                                                        final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                            "type": "response.output_item.added",
+                                                            "output_index": 0,
+                                                            "item": {
+                                                                "id": mid,
+                                                                "type": "message",
+                                                                "role": "assistant",
+                                                                "content": [{"type": "output_text", "text": "", "annotations": []}]
+                                                            }
+                                                        })).unwrap_or_default()));
+                                                        final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                            "type": "response.output_text.delta",
+                                                            "item_id": mid,
+                                                            "delta": txt,
+                                                        })).unwrap_or_default()));
+                                                        final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                            "type": "response.output_item.done",
+                                                            "output_index": 0,
+                                                            "item": {
+                                                                "id": mid,
+                                                                "type": "message",
+                                                                "role": "assistant",
+                                                                "content": [{"type": "output_text", "text": txt, "annotations": []}]
+                                                            }
+                                                        })).unwrap_or_default()));
+                                                        final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
+                                                            "type": "response.completed",
+                                                            "response": {
+                                                                "id": completion_id,
+                                                                "object": "response",
+                                                                "created_at": created,
+                                                                "model": model,
+                                                                "usage": {
+                                                                    "input_tokens": prompt_tokens,
+                                                                    "output_tokens": recovery_tokens,
+                                                                    "total_tokens": prompt_tokens + recovery_tokens,
+                                                                }
+                                                            }
+                                                        })).unwrap_or_default()));
+                                                    } else {
+                                                        final_chunks.push_str(&format!(
+                                                            "data: {}\n\n",
+                                                            build_stream_chunk(&completion_id, &model, created,
+                                                                serde_json::json!({"role": "assistant", "content": txt}),
+                                                                None,
+                                                            )
+                                                        ));
+                                                        final_chunks.push_str(&format!(
+                                                            "data: {}\n\n",
+                                                            build_stream_chunk(&completion_id, &model, created,
+                                                                serde_json::json!({}),
+                                                                Some("stop"),
+                                                            )
+                                                        ));
+                                                    }
+                                                    final_chunks.push_str("data: [DONE]\n\n");
+                                                    return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, true, false, true, prev_len, prev_thinking_len, thinking_role_sent, true, true, String::new())));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, chat_id = %chat_id_for_fb, "Stream tool error recovery failed, falling back to error chunks");
+                                            }
+                                        }
+                                        // Fallback: original error behavior
                                         if is_responses_api {
                                             final_chunks.push_str(&format!("data: {}\n\n", serde_json::to_string(&serde_json::json!({
                                                 "type": "error",
@@ -899,11 +1001,6 @@ async fn handler(
                                                 )
                                             ));
                                         }
-                                        // Phase 3: spawn detached feedback for detect_qwen_tool_error path (best-effort)
-                                        let pid_for_fb = parent_store.lock().await.clone();
-                                        let fb = build_qwen_tool_error_feedback(&err_msg);
-                                        spawn_feedback_if_hallucinated(chat_id_for_fb.clone(), pid_for_fb, fb, token_for_fb.clone());
-                                        info!(chat_id = %chat_id_for_fb, error = %err_msg, "Phase 3 feedback spawned async (stream detect_qwen err)");
                                         return Some((Ok::<_, std::io::Error>(Frame::data(Bytes::from(final_chunks))), (rx, buf, full_text, tool_emitted, content_emitted, true, prev_len, prev_thinking_len, thinking_role_sent, resp_created, output_started, item_id)));
                                     }
                                 }
@@ -1267,48 +1364,82 @@ async fn handler(
                 if !full_text.is_empty() && !tools.is_empty() {
                     if let Some(err_msg) = detect_qwen_tool_error(&full_text) {
                         error!(error = %err_msg, "Qwen returned tool error in response text");
-                        // Phase 3: feedback injection for non-stream detect_qwen_tool_error (closes coverage gap;
-                        // stream detect_qwen paths already had spawn; now uniform with validate errs per plan §3.3).
-                        // Uses same await+set_parent pattern as the sibling non-stream validate err arm below.
-                        let fb = build_qwen_tool_error_feedback(&err_msg);
+                        let tool_name = extract_tool_name_from_error(&err_msg);
+                        let ok_fb = build_synthetic_tool_ok_feedback_for_name(&tool_name);
+                        let mut recovery_succeeded = false;
                         if let Some(pid) = &latest_pid {
-                            match send_qwen_chat_continuation(
+                            match send_qwen_continuation_and_get_response(
                                 &session_id,
                                 Some(pid),
-                                &fb,
+                                &ok_fb,
                                 &st.token,
                             )
                             .await
                             {
-                                Ok(Some(new_pid)) => {
-                                    session.set_parent_id(new_pid.clone()).await;
-                                    info!(
-                                        chat_id = %session_id,
-                                        new_parent = %new_pid,
-                                        error = %err_msg,
-                                        "Phase 3: feedback injected into Qwen chat for non-stream detect_qwen_tool_error"
-                                    );
-                                }
-                                Ok(None) => {
-                                    warn!(chat_id = %session_id, "Phase 3: feedback send completed with no new_pid (detect_qwen non-stream, best-effort)");
+                                Ok(result) => {
+                                    if let Some(new_pid) = result.new_parent_id {
+                                        session.set_parent_id(new_pid.clone()).await;
+                                        info!(
+                                            chat_id = %session_id,
+                                            new_parent = %new_pid,
+                                            error = %err_msg,
+                                            tool_name = %tool_name,
+                                            "Tool error recovery: synthetic OK injected, new response obtained"
+                                        );
+                                    } else {
+                                        info!(
+                                            chat_id = %session_id,
+                                            error = %err_msg,
+                                            "Tool error recovery: synthetic OK injected (no new_pid)"
+                                        );
+                                    }
+                                    let new_text = result.response_text;
+                                    if !new_text.is_empty() {
+                                        recovery_succeeded = true;
+                                        let new_tokens = estimate_tokens(&new_text);
+                                        let total = prompt_tokens + new_tokens;
+                                        let resp_value = serde_json::json!({
+                                            "id": completion_id,
+                                            "object": "chat.completion",
+                                            "created": created,
+                                            "model": model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "message": {
+                                                    "role": "assistant",
+                                                    "content": new_text,
+                                                },
+                                                "finish_reason": "stop"
+                                            }],
+                                            "usage": {
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": new_tokens,
+                                                "total_tokens": total
+                                            }
+                                        });
+                                        return Ok(json_response(StatusCode::OK, &resp_value)
+                                            .map(|b| box_body(b)));
+                                    }
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, chat_id = %session_id, "Phase 3: feedback send failed (detect_qwen non-stream, non-fatal, client still gets clean 400)");
+                                    warn!(error = %e, chat_id = %session_id, "Tool error recovery failed, falling back to error response");
                                 }
                             }
                         } else {
-                            warn!(chat_id = %session_id, "Phase 3: no latest_pid captured for detect_qwen non-stream; skipping injection (still 400)");
+                            warn!(chat_id = %session_id, "No latest_pid for tool error recovery; returning error");
                         }
-                        let mut err = serde_json::json!({
-                            "message": err_msg,
-                            "type": "invalid_request_error",
-                        });
-                        err["available_tools"] = serde_json::json!(tools);
-                        return Ok(json_response(
-                            StatusCode::BAD_REQUEST,
-                            &serde_json::json!({"error": err}),
-                        )
-                        .map(|b| box_body(b)));
+                        if !recovery_succeeded {
+                            let mut err = serde_json::json!({
+                                "message": err_msg,
+                                "type": "invalid_request_error",
+                            });
+                            err["available_tools"] = serde_json::json!(tools);
+                            return Ok(json_response(
+                                StatusCode::BAD_REQUEST,
+                                &serde_json::json!({"error": err}),
+                            )
+                            .map(|b| box_body(b)));
+                        }
                     }
                 }
 
