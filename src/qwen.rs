@@ -1512,8 +1512,8 @@ Done."#;
         let tcs = detect_tools(text, &allowed);
         assert_eq!(tcs.len(), 2);
         let names: Vec<_> = tcs.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"foo"));
-        assert!(names.contains(&"terminal")); // canonical emitted, not the prefixed
+        assert!(names.contains(&"get_foo"));
+        assert!(names.contains(&"bash_terminal")); // raw name, normalization happens in validate_tool_calls
     }
 
     #[test]
@@ -1524,12 +1524,12 @@ Done."#;
 ```"#;
         let raw = detect_tools(text, &allowed);
         assert_eq!(raw.len(), 1);
-        assert_eq!(raw[0].name, "ls");
+        assert_eq!(raw[0].name, "bash_ls"); // raw name from detect, normalization happens in validate
         let validated = validate_tool_calls_with_flags(raw, &allowed, true, false, false);
         match validated {
             ToolGateResult::Emit { emit, .. } => {
                 assert_eq!(emit.len(), 1);
-                assert_eq!(emit[0].name, "ls");
+                assert_eq!(emit[0].name, "ls"); // canonical name after validation norm
             }
             ToolGateResult::Blocked(bads) => {
                 panic!("expected 1 good via norm, got blocked {:?}", bads)
