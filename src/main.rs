@@ -1261,8 +1261,9 @@ async fn handler(
                         )
                         .map(box_body));
                     }
-                    return Ok(internal_error(format!("Qwen API returned {}", status))
-                        .map(box_body));
+                    return Ok(
+                        internal_error(format!("Qwen API returned {}", status)).map(box_body)
+                    );
                 }
                 // body_text now from blocking ureq; proceed with original line processing (includes set_parent_id awaits)
                 let mut acc = AccumulatedText::new();
