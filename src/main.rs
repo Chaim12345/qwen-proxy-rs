@@ -3,7 +3,7 @@ mod qwen;
 mod session;
 mod streaming;
 
-use crate::constants::{MODEL_NAME, QWEN_API_BASE};
+use crate::constants::{MAX_PROMPT_CHARS, MODEL_NAME, QWEN_API_BASE};
 use anyhow::{bail, Context, Result};
 
 use futures::StreamExt;
@@ -189,15 +189,18 @@ fn request_model(v: &serde_json::Value) -> String {
 
 /// OpenAI-compatible clients (Cursor, OpenCode, DeepSeek-compat) read `reasoning_content`
 /// in the delta — not a custom `thinking` field.
-fn build_reasoning_delta(text: &str, first: bool) -> serde_json::Value {
-    let mut delta = serde_json::json!({
+fn build_reasoning_delta(text: &str, first: bool, delta: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::json!({
         "reasoning_content": text,
         "thinking": text,
     });
     if first {
-        delta["role"] = serde_json::json!("assistant");
+        out["role"] = serde_json::json!("assistant");
     }
-    delta
+    if let Some(tc) = delta.get("tool_calls") {
+        out["tool_calls"] = tc.clone();
+    }
+    out
 }
 
 fn build_stream_chunk(
@@ -356,10 +359,7 @@ fn construct_tool_error_json(
 
 /// Build the unified error JSON for upstream Qwen tool errors (e.g. "Tool X does not exist").
 /// Includes `available_tools` for client debugging, matching the hallucinated-tool format.
-fn construct_tool_error_upstream(
-    err_msg: &str,
-    tools: &[serde_json::Value],
-) -> serde_json::Value {
+fn construct_tool_error_upstream(err_msg: &str, tools: &[serde_json::Value]) -> serde_json::Value {
     let mut err = serde_json::json!({
         "message": err_msg,
         "type": "invalid_request_error",
@@ -613,7 +613,7 @@ async fn handler(
 
     let json_bytes = body_bytes.to_vec();
 
-    let v: serde_json::Value = match serde_json::from_slice(&json_bytes) {
+    let mut v: serde_json::Value = match serde_json::from_slice(&json_bytes) {
         Ok(v) => v,
         Err(e) => {
             return Ok(bad_request(format!("Invalid JSON: {}", e)).map(box_body));
@@ -630,6 +630,34 @@ async fn handler(
 
     if messages.is_empty() {
         return Ok(bad_request("messages array cannot be empty").map(box_body));
+    }
+
+    let msg_count_before = messages.len();
+    if qwen::truncate_for_context_limit(&mut v, MAX_PROMPT_CHARS) {
+        let msgs_after = v
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .or_else(|| v.get("input").and_then(|m| m.as_array()));
+        let msg_count_after = msgs_after.map(|m| m.len()).unwrap_or(0);
+        warn!(
+            removed = msg_count_before - msg_count_after,
+            remaining = msg_count_after,
+            "Client request exceeded context limit; oldest messages dropped"
+        );
+    }
+
+    let messages = if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+        msgs
+    } else if let Some(input) = v.get("input").and_then(|m| m.as_array()) {
+        input
+    } else {
+        return Ok(bad_request("messages or input array is required").map(box_body));
+    };
+
+    if messages.is_empty() {
+        return Ok(
+            bad_request("messages array empty after context limit truncation").map(box_body),
+        );
     }
 
     let is_responses_api = v.get("input").is_some() && v.get("messages").is_none();
@@ -796,6 +824,7 @@ async fn handler(
                         Some(Ok(line)) => {
                             // Track whether this chunk signals stream completion.
                             let mut stream_finished = false;
+                            let mut qwen_delta: Option<serde_json::Value> = None;
                             if let Some(data) = parse_qwen_sse_line(&line) {
                                 if let Ok(ch) = serde_json::from_str::<serde_json::Value>(&data) {
                                     if let Some(pid) = extract_response_parent_id(&ch) {
@@ -804,6 +833,16 @@ async fn handler(
                                     if let Some(delta) = extract_qwen_sse_delta(&ch) {
                                         stream_finished = delta.finished;
                                         st.full_text.append(&delta);
+                                    }
+                                    if let Some(delta_obj) = ch
+                                        .get("choices")
+                                        .and_then(|c: &serde_json::Value| c.as_array())
+                                        .and_then(|c| c.first())
+                                        .and_then(|c: &serde_json::Value| c.get("delta"))
+                                    {
+                                        if let Some(tc) = delta_obj.get("tool_calls") {
+                                            qwen_delta = Some(tc.clone());
+                                        }
                                     }
                                 }
                             }
@@ -821,11 +860,11 @@ async fn handler(
                             }
                 let thinking = st.full_text.thinking();
                 if thinking.len() > st.prev_thinking_len {
-                    let delta = &thinking[st.prev_thinking_len..];
+                    let delta_text = &thinking[st.prev_thinking_len..];
                     let first_thinking = !st.thinking_role_sent;
                     oai_chunks.push(build_stream_chunk(
                         &completion_id, &model, created,
-                        build_reasoning_delta(delta, first_thinking),
+                        build_reasoning_delta(delta_text, first_thinking, qwen_delta.as_ref().unwrap_or(&serde_json::Value::Null)),
                         None,
                     ));
                     st.thinking_role_sent = true;
@@ -837,7 +876,12 @@ async fn handler(
                             // complete payload for validate before any build_tool_call_stream_chunks or responses-api
                             // emission. No extra end-of-stream buffering required for name validation (tool JSON is atomic).
             if !st.tool_emitted && !st.content_emitted && stream_finished {
-                let raw_tcs = detect_tools(st.full_text.full_answer(), &tools);
+                let combined = format!(
+                    "{}\n{}",
+                    st.full_text.thinking(),
+                    st.full_text.full_answer()
+                );
+                let raw_tcs = detect_tools(&combined, &tools);
                                 let pid_for_gate = parent_store.lock().await.clone();
                                 let tcs = match tool_gate_stream(
                                     raw_tcs,
@@ -1433,66 +1477,71 @@ async fn handler(
                 }
 
                 if !full_text.is_empty() && !tools.is_empty() {
-        if let Some(err_msg) = detect_qwen_tool_error(&full_text) {
-            error!(error = %err_msg, "Qwen returned tool error in response text");
-            match tool_error_recovery(&session_id, latest_pid.as_deref(), &st.token, &err_msg).await {
-                Ok(result) => {
-                    if let Some(new_pid) = result.new_parent_id {
-                        session.set_parent_id(new_pid.clone()).await;
-                        info!(
-                            chat_id = %session_id,
-                            new_parent = %new_pid,
-                            error = %err_msg,
-                            "Tool error recovery: synthetic OK injected, new response obtained"
-                        );
-                    } else {
-                        info!(
-                            chat_id = %session_id,
-                            error = %err_msg,
-                            "Tool error recovery: synthetic OK injected (no new_pid)"
-                        );
-                    }
-                    let new_text = result.response_text;
-                    if !new_text.is_empty() {
-                        let new_tokens = estimate_tokens(&new_text);
-                        let total = prompt_tokens + new_tokens;
-                        let resp_value = serde_json::json!({
-                            "id": completion_id,
-                            "object": "chat.completion",
-                            "created": created,
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": new_text,
-                                },
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": new_tokens,
-                                "total_tokens": total
+                    if let Some(err_msg) = detect_qwen_tool_error(&full_text) {
+                        error!(error = %err_msg, "Qwen returned tool error in response text");
+                        match tool_error_recovery(
+                            &session_id,
+                            latest_pid.as_deref(),
+                            &st.token,
+                            &err_msg,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                if let Some(new_pid) = result.new_parent_id {
+                                    session.set_parent_id(new_pid.clone()).await;
+                                    info!(
+                                        chat_id = %session_id,
+                                        new_parent = %new_pid,
+                                        error = %err_msg,
+                                        "Tool error recovery: synthetic OK injected, new response obtained"
+                                    );
+                                } else {
+                                    info!(
+                                        chat_id = %session_id,
+                                        error = %err_msg,
+                                        "Tool error recovery: synthetic OK injected (no new_pid)"
+                                    );
+                                }
+                                let new_text = result.response_text;
+                                if !new_text.is_empty() {
+                                    let new_tokens = estimate_tokens(&new_text);
+                                    let total = prompt_tokens + new_tokens;
+                                    let resp_value = serde_json::json!({
+                                        "id": completion_id,
+                                        "object": "chat.completion",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": new_text,
+                                            },
+                                            "finish_reason": "stop"
+                                        }],
+                                        "usage": {
+                                            "prompt_tokens": prompt_tokens,
+                                            "completion_tokens": new_tokens,
+                                            "total_tokens": total
+                                        }
+                                    });
+                                    return Ok(
+                                        json_response(StatusCode::OK, &resp_value).map(box_body)
+                                    );
+                                }
                             }
-                        });
-                        return Ok(json_response(StatusCode::OK, &resp_value)
-                            .map(box_body));
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, chat_id = %session_id, "Tool error recovery failed, falling back to error response");
-                }
-            }
-            let err_json = construct_tool_error_upstream(&err_msg, &tools);
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &err_json,
-            )
-            .map(box_body));
+                            Err(e) => {
+                                warn!(error = %e, chat_id = %session_id, "Tool error recovery failed, falling back to error response");
+                            }
+                        }
+                        let err_json = construct_tool_error_upstream(&err_msg, &tools);
+                        return Ok(json_response(StatusCode::BAD_REQUEST, &err_json).map(box_body));
                     }
                 }
 
-                let raw_tcs = detect_tools(&full_text, &tools);
+                let combined = format!("{}\n{}", acc.thinking(), acc.full_answer());
+                let raw_tcs = detect_tools(&combined, &tools);
                 let tcs = match tool_gate_nonstream(
                     raw_tcs,
                     &tools,
@@ -1827,4 +1876,262 @@ fn main() -> Result<()> {
         info!("Shutdown complete");
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_session_key_user_field() {
+        let v = serde_json::json!({
+            "user": "alice",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("user:alice"),
+            "should use user field: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_user_field_with_tools() {
+        let v = serde_json::json!({
+            "user": "alice",
+            "tools": [{"name": "bash", "description": "", "parameters": {}}]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("user:alice:t"),
+            "should include tools suffix: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_empty_user_skipped() {
+        let v = serde_json::json!({
+            "user": "",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("conv:"),
+            "empty user should fall through to message hash"
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_metadata_session_id() {
+        let v = serde_json::json!({
+            "metadata": {"session_id": "sess-123"},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("meta:session_id:sess-123"),
+            "should use metadata.session_id: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_metadata_conversation_id() {
+        let v = serde_json::json!({
+            "metadata": {"conversation_id": "conv-456"},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("meta:conversation_id:conv-456"),
+            "should use metadata.conversation_id: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_metadata_chat_id() {
+        let v = serde_json::json!({
+            "metadata": {"chat_id": "chat-789"},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("meta:chat_id:chat-789"),
+            "should use metadata.chat_id: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_metadata_empty_id_skipped() {
+        let v = serde_json::json!({
+            "metadata": {"session_id": ""},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("conv:"),
+            "empty metadata id should fall through: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_first_user_message_hash() {
+        let v = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello world"}
+            ]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("conv:"),
+            "should use first user message hash: {}",
+            key
+        );
+        assert!(
+            !key.contains("system"),
+            "system message should not be in key"
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_message_array_input() {
+        let v = serde_json::json!({
+            "input": [
+                {"role": "user", "content": "test input"}
+            ]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("conv:"),
+            "should also check 'input' array: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_message_with_text_part() {
+        let v = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hello from parts"}]
+            }]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("conv:"),
+            "should extract text from content array: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_message_with_input_text() {
+        let v = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "input text content"}]
+            }]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("conv:"),
+            "should extract input_text from content array: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_message_empty_content_falls_through() {
+        let v = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": ""},
+                {"role": "user", "content": "second message"}
+            ]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("conv:"),
+            "empty first content should fall through: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_ephemeral_fallback() {
+        let v = serde_json::json!({
+            "messages": [{"role": "assistant", "content": "I am a bot"}]
+        });
+        let key = client_session_key(&v);
+        assert!(
+            key.starts_with("ephemeral:"),
+            "no user messages should use ephemeral: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_tools_suffix_stable() {
+        let tools = vec![
+            serde_json::json!({"name": "bash", "description": "", "parameters": {}}),
+            serde_json::json!({"name": "read", "description": "", "parameters": {}}),
+        ];
+        let v1 = serde_json::json!({
+            "user": "alice",
+            "tools": tools,
+        });
+        let v2 = serde_json::json!({
+            "user": "alice",
+            "tools": tools,
+        });
+        assert_eq!(
+            client_session_key(&v1),
+            client_session_key(&v2),
+            "same tools should produce same session key"
+        );
+    }
+
+    #[test]
+    fn test_client_session_key_tools_suffix_different_tools() {
+        let v1 = serde_json::json!({
+            "user": "alice",
+            "tools": [{"name": "bash", "description": "", "parameters": {}}],
+        });
+        let v2 = serde_json::json!({
+            "user": "alice",
+            "tools": [{"name": "read", "description": "", "parameters": {}}],
+        });
+        let key1 = client_session_key(&v1);
+        let key2 = client_session_key(&v2);
+        assert_ne!(key1, key2, "different tools should produce different keys");
+    }
+
+    #[test]
+    fn test_fnv1a_hash_deterministic() {
+        let h1 = fnv1a_hash("hello");
+        let h2 = fnv1a_hash("hello");
+        assert_eq!(h1, h2, "same input should produce same hash");
+        assert_ne!(fnv1a_hash("hello"), fnv1a_hash("world"));
+    }
+
+    #[test]
+    fn test_session_tools_suffix_empty_for_no_tools() {
+        let v = serde_json::json!({});
+        assert_eq!(session_tools_suffix(&v), "", "no tools means no suffix");
+    }
+
+    #[test]
+    fn test_session_tools_suffix_empty_for_empty_tools() {
+        let v = serde_json::json!({"tools": []});
+        assert_eq!(
+            session_tools_suffix(&v),
+            "",
+            "empty tools array means no suffix"
+        );
+    }
 }

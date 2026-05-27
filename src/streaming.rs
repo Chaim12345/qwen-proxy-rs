@@ -7,39 +7,28 @@ use futures::Stream;
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tracing::{debug, error, trace};
 
-#[allow(dead_code)]
 pub struct SseLine {
     pub raw: String,
-    pub request_id: Arc<str>,
 }
 
 pub struct QwenSseStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     buf: String,
     ready: VecDeque<String>,
-    request_id: Arc<str>,
     finished: bool,
 }
 
 impl QwenSseStream {
     pub fn new(resp: reqwest::Response) -> Self {
-        let request_id: Arc<str> = resp
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .into();
-        debug!(status = %resp.status(), request_id = %request_id, "Qwen SSE stream opened (reqwest)");
+        debug!(status = %resp.status(), "Qwen SSE stream opened (reqwest)");
         Self {
             inner: Box::pin(resp.bytes_stream()),
             buf: String::new(),
             ready: VecDeque::new(),
-            request_id,
             finished: false,
         }
     }
@@ -64,18 +53,12 @@ impl Stream for QwenSseStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             if let Some(line) = self.ready.pop_front() {
-                return Poll::Ready(Some(Ok(SseLine {
-                    raw: line,
-                    request_id: Arc::clone(&self.request_id),
-                })));
+                return Poll::Ready(Some(Ok(SseLine { raw: line })));
             }
             if self.finished {
                 if !self.buf.is_empty() {
                     let line = std::mem::take(&mut self.buf);
-                    return Poll::Ready(Some(Ok(SseLine {
-                        raw: line,
-                        request_id: Arc::clone(&self.request_id),
-                    })));
+                    return Poll::Ready(Some(Ok(SseLine { raw: line })));
                 }
                 return Poll::Ready(None);
             }

@@ -181,8 +181,13 @@ pub fn process_structured_output(text: &str, rf: Option<&Value>) -> Result<Strin
 }
 
 /// Detect tool-related error messages in Qwen response text.
+/// Narrowed to reduce false positives (see review F3).
+/// - Primary: "Tool X does not exist(s)" (capital T, starts the sentence)
+/// - Secondary: "cannot use/can't use/unable to use tool" within 30 chars
+/// - Tertiary: "tool not found" / "tool_not_found"
+/// - Max-length guard of 300 chars (Qwen tool errors are short)
 pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
-    if text.is_empty() {
+    if text.is_empty() || text.len() > 300 {
         return None;
     }
     if text.contains("Tool ")
@@ -191,19 +196,16 @@ pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
         let end = text.find('.').unwrap_or(text.len());
         return Some(text[..end].to_string());
     }
-    if (text.contains("cannot use") || text.contains("can't use") || text.contains("unable to use"))
-        && text.contains("tool")
-    {
-        let end = text.find('.').unwrap_or(text.len().min(200));
-        return Some(text[..end].to_string());
+    for phrase in ["cannot use", "can't use", "unable to use"] {
+        if let Some(pos) = text.find(phrase) {
+            let nearby = &text[pos..text.len().min(pos + 50)];
+            if nearby.contains("tool") {
+                let end = text.find('.').unwrap_or(text.len().min(200));
+                return Some(text[..end].to_string());
+            }
+        }
     }
     if text.contains("tool not found") || text.contains("tool_not_found") {
-        let end = text.find('.').unwrap_or(text.len().min(200));
-        return Some(text[..end].to_string());
-    }
-    if text.len() < 100
-        && (text.contains("抱歉") || (text.contains("sorry") && text.contains("tool")))
-    {
         let end = text.find('.').unwrap_or(text.len().min(200));
         return Some(text[..end].to_string());
     }
@@ -644,6 +646,71 @@ fn message_content_to_string(content: &Value) -> String {
             .join("\n");
     }
     String::new()
+}
+
+/// Estimate token count from a serialized JSON string.
+/// Uses len/4 as a rough approximation (conservative for multi-language text).
+fn estimate_tokens_from_str(s: &str) -> usize {
+    std::cmp::max(1, s.len() / 4)
+}
+
+/// Truncate conversation history in `v` if it exceeds `max_chars`.
+/// Preserves all system messages (at the start) and the most recent exchanges,
+/// removing oldest messages from the middle.
+/// Operates on both `messages` and `input` (Responses API) arrays.
+/// Returns `true` if truncation was performed.
+pub fn truncate_for_context_limit(v: &mut Value, max_chars: usize) -> bool {
+    let mut truncated_any = false;
+    for field in ["messages", "input"] {
+        let Some(msgs) = v.get_mut(field).and_then(|m| m.as_array_mut()) else {
+            continue;
+        };
+        if msgs.is_empty() {
+            continue;
+        }
+        let msg_str = serde_json::to_string(msgs).unwrap_or_default();
+        if msg_str.len() <= max_chars {
+            continue;
+        }
+        let target_chars = max_chars.saturating_sub(max_chars / 10);
+        if estimate_tokens_from_str(&msg_str) * 4 <= max_chars {
+            continue;
+        }
+        let system_count = msgs
+            .iter()
+            .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            .count();
+        let recent_count = std::cmp::min(20, msgs.len().saturating_sub(system_count));
+        let recent_start = msgs.len().saturating_sub(recent_count);
+        let system_msgs: Vec<Value> = msgs[..system_count].iter().cloned().collect();
+        let recent_msgs: Vec<Value> = msgs[recent_start..].iter().cloned().collect();
+        let mut merged: Vec<Value> = Vec::with_capacity(system_msgs.len() + recent_msgs.len());
+        merged.extend(system_msgs);
+        merged.extend(recent_msgs);
+        let mut removed_count = msgs.len().saturating_sub(merged.len());
+        'inner: loop {
+            let merged_str = serde_json::to_string(&merged).unwrap_or_default();
+            if merged_str.len() <= target_chars {
+                if removed_count > 0 {
+                    warn!(
+                        removed_msgs = removed_count,
+                        remaining_msgs = merged.len(),
+                        "Conversation history truncated to fit context limit"
+                    );
+                    truncated_any = true;
+                }
+                *msgs = merged;
+                break 'inner;
+            }
+            if merged.len() <= 2 {
+                warn!("Conversation too large even for minimal messages; rejecting");
+                break 'inner;
+            }
+            merged.remove(1);
+            removed_count += 1;
+        }
+    }
+    truncated_any
 }
 
 pub fn build_message(v: &Value) -> String {
@@ -1726,6 +1793,237 @@ Done."#;
         assert_eq!(
             crate::constants::qwen_upstream_model(Some("qwen3.7-max")),
             "qwen3.7-max"
+        );
+    }
+
+    // ── F3: detect_qwen_tool_error tests ──
+
+    #[test]
+    fn test_detect_qwen_tool_error_true_positives() {
+        assert!(
+            detect_qwen_tool_error("Tool bash does not exist.").is_some(),
+            "capital-T 'Tool' + 'does not exist' should detect"
+        );
+        assert!(
+            detect_qwen_tool_error("Tool search does not exists.").is_some(),
+            "'does not exists' (typo) should detect"
+        );
+        assert!(
+            detect_qwen_tool_error("Tool get_file does not exist").is_some(),
+            "without trailing period should detect"
+        );
+        assert!(
+            detect_qwen_tool_error("Tool web_search cannot use").is_some(),
+            "'cannot use' + nearby 'tool' should detect"
+        );
+        assert!(
+            detect_qwen_tool_error("I can't use that tool here.").is_some(),
+            "'can't use' + nearby 'tool' should detect"
+        );
+        assert!(
+            detect_qwen_tool_error("Unable to use tool provided.").is_some(),
+            "'unable to use' + nearby 'tool' should detect"
+        );
+        assert!(
+            detect_qwen_tool_error("tool not found").is_some(),
+            "'tool not found' should detect"
+        );
+        assert!(
+            detect_qwen_tool_error("tool_not_found in your request").is_some(),
+            "'tool_not_found' should detect"
+        );
+    }
+
+    #[test]
+    fn test_detect_qwen_tool_error_false_positives() {
+        assert!(
+            detect_qwen_tool_error("I'm sorry, I cannot use informal language.").is_none(),
+            "'cannot use' without 'tool' nearby should not trigger"
+        );
+        assert!(
+            detect_qwen_tool_error("I can't use that feature.").is_none(),
+            "'can't use' without 'tool' should not trigger"
+        );
+        assert!(
+            detect_qwen_tool_error("tool calling is disabled").is_none(),
+            "'tool' without the specific phrases should not trigger"
+        );
+        assert!(
+            detect_qwen_tool_error("which tool do you mean?").is_none(),
+            "'tool' without error phrases should not trigger"
+        );
+        assert!(
+            detect_qwen_tool_error("Use the search tool.").is_none(),
+            "benign 'tool' usage should not trigger"
+        );
+        assert!(
+            detect_qwen_tool_error("tool does not appear in the list").is_none(),
+            "'tool' + 'does not' but not 'Tool ' prefix should not trigger"
+        );
+        assert!(
+            detect_qwen_tool_error("I'm unable to help with that.").is_none(),
+            "'unable' without 'use tool' should not trigger"
+        );
+        assert!(
+            detect_qwen_tool_error("the tool was not found in the map").is_none(),
+            "'tool' + 'not found' but not the exact phrases should not trigger"
+        );
+    }
+
+    #[test]
+    fn test_detect_qwen_tool_error_max_length_guard() {
+        let long = "x".repeat(301);
+        assert!(
+            detect_qwen_tool_error(&long).is_none(),
+            "text over 300 chars should not be scanned"
+        );
+        let exactly_300 = "x".repeat(300);
+        assert!(
+            detect_qwen_tool_error(&exactly_300).is_none(),
+            "text at 300 chars should not be scanned"
+        );
+        let short_tool_error = format!("Tool bash does not exist.{}", "x".repeat(280));
+        assert!(
+            detect_qwen_tool_error(&short_tool_error).is_none(),
+            "tool error format but over 300 chars should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_detect_qwen_tool_error_truncation() {
+        let long_msg = "Tool mytool does not exist. Additional context about why.";
+        let result = detect_qwen_tool_error(long_msg);
+        assert!(result.is_some());
+        let extracted = result.unwrap();
+        assert!(
+            !extracted.contains("Additional context"),
+            "should truncate at first period"
+        );
+        assert!(extracted.ends_with("does not exist"));
+    }
+
+    #[test]
+    fn test_detect_qwen_tool_error_chinese_not_triggered() {
+        assert!(
+            detect_qwen_tool_error("抱歉，无法使用该工具").is_none(),
+            "Chinese text should not trigger tool error detection"
+        );
+        assert!(
+            detect_qwen_tool_error("对不起，这个工具不能使用").is_none(),
+            "Chinese with 'use' and 'tool' should not trigger (not English)"
+        );
+    }
+
+    #[test]
+    fn test_detect_qwen_tool_error_empty() {
+        assert!(
+            detect_qwen_tool_error("").is_none(),
+            "empty string returns None"
+        );
+    }
+
+    // ── Context truncation tests ──
+
+    #[test]
+    fn test_truncate_preserves_system_message() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+            ]
+        });
+        let changed = truncate_for_context_limit(&mut v, 100);
+        assert!(changed, "should truncate when under limit");
+        let msgs = v["messages"].as_array().unwrap();
+        assert!(
+            msgs[0]["role"] == "system",
+            "system message must be preserved"
+        );
+        assert!(
+            msgs[0]["content"] == "You are a helpful assistant.",
+            "system content must not change"
+        );
+    }
+
+    #[test]
+    fn test_truncate_keeps_recent_messages() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+            ]
+        });
+        for i in 0..50 {
+            v["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"role": "user", "content": format!("message {}", i)}));
+        }
+        let before = v["messages"].as_array().unwrap().len();
+        truncate_for_context_limit(&mut v, 500);
+        let after = v["messages"].as_array().unwrap().len();
+        assert!(
+            after < before,
+            "should have removed messages: {} -> {}",
+            before,
+            after
+        );
+        assert!(
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .map(|m| m["content"].as_str().unwrap().contains("49"))
+                .unwrap_or(false),
+            "most recent messages should be kept"
+        );
+    }
+
+    #[test]
+    fn test_truncate_under_limit_does_nothing() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ]
+        });
+        let result = truncate_for_context_limit(&mut v, 10_000);
+        assert!(!result, "should not truncate when under limit");
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_truncate_handles_both_messages_and_input_fields() {
+        let mut v = serde_json::json!({
+            "input": [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "long message"},
+            ]
+        });
+        let result = truncate_for_context_limit(&mut v, 200);
+        assert!(!result, "small input should not truncate");
+        assert_eq!(v["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_truncate_only_system_message_preserved() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "msg1"},
+                {"role": "assistant", "content": "msg2"},
+                {"role": "user", "content": "msg3"},
+            ]
+        });
+        truncate_for_context_limit(&mut v, 500);
+        let msgs = v["messages"].as_array().unwrap();
+        assert!(
+            !msgs.is_empty() && msgs[0]["role"] == "system",
+            "system message should always be at index 0"
+        );
+        assert!(
+            msgs.len() < 5,
+            "non-system messages should have been removed"
         );
     }
 }

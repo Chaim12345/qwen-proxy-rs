@@ -2,6 +2,14 @@
 pub const MODEL_NAME: &str = "qwen3.7-max";
 pub const QWEN_API_BASE: &str = "https://chat.qwen.ai/api/v2";
 
+/// Maximum prompt characters accepted before truncation.
+/// Qwen3.7-Max supports ~1M token context. Using ~3.5M chars as a conservative
+/// estimate (≈ 1M tokens × 3.5 chars/token, with safety margin for
+/// multi-language / special-token overhead). If the serialized prompt exceeds
+/// this, old messages are dropped from the middle of the history while
+/// preserving the system prompt and the most recent exchanges.
+pub const MAX_PROMPT_CHARS: usize = 3_500_000;
+
 use std::sync::OnceLock;
 
 fn env_flag(name: &str, default: bool) -> bool {
