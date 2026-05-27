@@ -301,6 +301,47 @@ fn spawn_feedback_if_hallucinated(
 /// Small helper to DRY the 400 error shape for bad tool names (used by raw-body + non-stream validate err paths).
 /// (The non-stream detect_qwen_tool_error path uses a similar shape but with upstream err_msg, so keeps local build.)
 /// Keeps "available_tools" for client debugging (per Phase 2/4).
+async fn handle_blocked_tools_nonstream(
+    bad_names: &[String],
+    tools: &[serde_json::Value],
+    session_id: &str,
+    latest_pid: Option<&str>,
+    token: &str,
+    session: &session::AcquiredSession,
+    log_context: &str,
+) -> Response<Full<Bytes>> {
+    error!(
+        hallucinated_tool_names = ?bad_names,
+        client_tool_count = tools.len(),
+        "{}: blocking hallucinated tool names", log_context
+    );
+    let fb = build_tool_hallucination_feedback(bad_names);
+    if let Some(pid) = latest_pid {
+        match send_qwen_chat_continuation(session_id, Some(pid), &fb, token).await {
+            Ok(Some(new_pid)) => {
+                session.set_parent_id(new_pid.clone()).await;
+                info!(
+                    chat_id = %session_id,
+                    new_parent = %new_pid,
+                    hallucinated = ?bad_names,
+                    "Phase 3: feedback injected into Qwen chat — hallucination now in-context correction ({})",
+                    log_context
+                );
+            }
+            Ok(None) => {
+                warn!(chat_id = %session_id, "Phase 3: feedback send completed with no new_pid ({}, best-effort)", log_context);
+            }
+            Err(e) => {
+                warn!(error = %e, chat_id = %session_id, "Phase 3: feedback send failed ({}, non-fatal, client still gets clean 400)", log_context);
+            }
+        }
+    } else {
+        warn!(chat_id = %session_id, "Phase 3: no latest_pid captured; skipping feedback injection ({}, still returning 400 to client)", log_context);
+    }
+    let err_body = construct_tool_error_json(bad_names, tools);
+    json_response(StatusCode::BAD_REQUEST, &err_body)
+}
+
 fn construct_tool_error_json(
     bad_names: &[String],
     tools: &[serde_json::Value],
@@ -1257,22 +1298,25 @@ async fn handler(
                     }
                 }
 
-if full_text.is_empty() && !tools.is_empty() {
-        // Check for Qwen tool errors in the raw body even when accumulated answer is empty
-        // (e.g., all text was in a non-answer phase or the error is in the SSE metadata).
-        if let Some(err_msg) = detect_qwen_tool_error(&body_text) {
-            error!(error = %err_msg, "Qwen returned tool error in raw body (empty full_text)");
-            let mut err = serde_json::json!({
-                "message": err_msg,
-                "type": "invalid_request_error",
-            });
-            err["available_tools"] = serde_json::json!(tools);
-            return Ok(json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": err}))
-                .map(|b| box_body(b)));
-        }
-        // Phase 4.1 / 3.4: close the raw-body bypass (was detect + direct emit with zero validate).
-        // Now uniform hard gate + feedback like the other 3 emission sites. Unknown names *never* leak.
-        let raw_tcs = detect_tools(&body_text, &tools);
+                if full_text.is_empty() && !tools.is_empty() {
+                    // Check for Qwen tool errors in the raw body even when accumulated answer is empty
+                    // (e.g., all text was in a non-answer phase or the error is in the SSE metadata).
+                    if let Some(err_msg) = detect_qwen_tool_error(&body_text) {
+                        error!(error = %err_msg, "Qwen returned tool error in raw body (empty full_text)");
+                        let mut err = serde_json::json!({
+                            "message": err_msg,
+                            "type": "invalid_request_error",
+                        });
+                        err["available_tools"] = serde_json::json!(tools);
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            &serde_json::json!({"error": err}),
+                        )
+                        .map(|b| box_body(b)));
+                    }
+                    // Phase 4.1 / 3.4: close the raw-body bypass (was detect + direct emit with zero validate).
+                    // Now uniform hard gate + feedback like the other 3 emission sites. Unknown names *never* leak.
+                    let raw_tcs = detect_tools(&body_text, &tools);
                     let tcs = match tool_gate_nonstream(
                         raw_tcs,
                         &tools,
@@ -1285,44 +1329,17 @@ if full_text.is_empty() && !tools.is_empty() {
                     {
                         Ok(good) => good,
                         Err(bad_names) => {
-                            error!(
-                                hallucinated_tool_names = ?bad_names,
-                                client_tool_count = tools.len(),
-                                "Phase 4.1 hard gate: blocking hallucinated tool names from raw-body emission (was bypass)"
-                            );
-                            // Same fb synthesis + await send + set + 400 as the full_text non-stream path (now DRY-able via helper)
-                            let fb = build_tool_hallucination_feedback(&bad_names);
-                            if let Some(pid) = &latest_pid {
-                                match send_qwen_chat_continuation(
-                                    &session_id,
-                                    Some(pid),
-                                    &fb,
-                                    &st.token,
-                                )
-                                .await
-                                {
-                                    Ok(Some(new_pid)) => {
-                                        session.set_parent_id(new_pid.clone()).await;
-                                        info!(
-                                            chat_id = %session_id,
-                                            new_parent = %new_pid,
-                                            hallucinated = ?bad_names,
-                                            "Phase 3: feedback injected into Qwen chat — hallucination now in-context correction (raw body path)"
-                                        );
-                                    }
-                                    Ok(None) => {
-                                        warn!(chat_id = %session_id, "Phase 3: feedback send completed with no new_pid (raw body, best-effort)");
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, chat_id = %session_id, "Phase 3: feedback send failed (raw body, non-fatal, client still gets clean 400)");
-                                    }
-                                }
-                            } else {
-                                warn!(chat_id = %session_id, "Phase 3: no latest_pid captured in raw body; skipping injection (still 400)");
-                            }
-                            let err_body = construct_tool_error_json(&bad_names, &tools);
-                            return Ok(json_response(StatusCode::BAD_REQUEST, &err_body)
-                                .map(|b| box_body(b)));
+                            return Ok(handle_blocked_tools_nonstream(
+                                &bad_names,
+                                &tools,
+                                &session_id,
+                                latest_pid.as_deref(),
+                                &st.token,
+                                &session,
+                                "Phase 4.1 raw-body",
+                            )
+                            .await
+                            .map(|b| box_body(b)));
                         }
                     };
                     if !tcs.is_empty() {
@@ -1469,49 +1486,17 @@ if full_text.is_empty() && !tools.is_empty() {
                 {
                     Ok(good) => good,
                     Err(bad_names) => {
-                        error!(
-                            hallucinated_tool_names = ?bad_names,
-                            client_tool_count = tools.len(),
-                            "Phase 2 hard gate: blocking hallucinated tool names from non-stream response"
-                        );
-                        // Phase 3 Feedback/Recovery IMPLEMENTED (see send_qwen_chat_continuation in qwen.rs):
-                        // We synthesize the exact "TOOL RESULT: ERROR..." and POST it as continuation using the
-                        // latest parent_id from this turn. The returned new_pid is set so future turns on this
-                        // client_session_key continue *after* the halluc + correction (in-context training signal).
-                        let fb = build_tool_hallucination_feedback(&bad_names);
-                        if let Some(pid) = &latest_pid {
-                            match send_qwen_chat_continuation(
-                                &session_id,
-                                Some(pid),
-                                &fb,
-                                &st.token,
-                            )
-                            .await
-                            {
-                                Ok(Some(new_pid)) => {
-                                    session.set_parent_id(new_pid.clone()).await;
-                                    info!(
-                                        chat_id = %session_id,
-                                        new_parent = %new_pid,
-                                        hallucinated = ?bad_names,
-                                        "Phase 3: feedback injected into Qwen chat — hallucination now in-context correction"
-                                    );
-                                }
-                                Ok(None) => {
-                                    warn!(chat_id = %session_id, "Phase 3: feedback send completed with no new_pid (best-effort)");
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, chat_id = %session_id, "Phase 3: feedback send failed (non-fatal, client still gets clean 400)");
-                                }
-                            }
-                        } else {
-                            warn!(chat_id = %session_id, "Phase 3: no latest_pid captured; skipping feedback injection (still returning 400 to client)");
-                        }
-                        // Phase 4.1: using shared constructor (DRY with raw-body path)
-                        let err_body = construct_tool_error_json(&bad_names, &tools);
-                        return Ok(
-                            json_response(StatusCode::BAD_REQUEST, &err_body).map(|b| box_body(b))
-                        );
+                        return Ok(handle_blocked_tools_nonstream(
+                            &bad_names,
+                            &tools,
+                            &session_id,
+                            latest_pid.as_deref(),
+                            &st.token,
+                            &session,
+                            "non-stream",
+                        )
+                        .await
+                        .map(|b| box_body(b)));
                     }
                 };
 
