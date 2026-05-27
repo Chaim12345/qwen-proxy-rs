@@ -847,42 +847,6 @@ fn try_parse_tool_json(json_str: &str) -> Option<ToolCall> {
     }
 }
 
-fn accept_tool_call(tc: ToolCall, tool_names: &[&str]) -> Option<ToolCall> {
-    let client_tool_count = tool_names.len();
-    if let Some(canonical) = is_tool_name_allowed(&tc.name, tool_names) {
-        let mut accepted = tc;
-        let used_norm = accepted.name != canonical;
-        if used_norm {
-            accepted.name = canonical;
-        }
-        info!(
-            tool_requested = %accepted.name,
-            tool_allowed = true,
-            client_tool_count,
-            normalized_match = used_norm,
-            "Tool call accepted (Layer 4 norm integrated)"
-        );
-        Some(accepted)
-    } else if crate::constants::tool_pass_through() || crate::constants::tool_synthetic_ok() {
-        info!(
-            tool_requested = %tc.name,
-            tool_allowed = false,
-            client_tool_count,
-            "Accepting unknown tool for detect (pass-through or synthetic-ok mode)"
-        );
-        Some(tc)
-    } else {
-        warn!(
-            tool_requested = %tc.name,
-            tool_allowed = false,
-            client_tool_count,
-            hallucinated_tool_names = ?vec![&tc.name],
-            "Tool call REJECTED - name not in client's allowed list (will not be emitted)"
-        );
-        None
-    }
-}
-
 /// Outcome of the tool validation gate (strict vs pass-through vs synthetic-ok).
 pub enum ToolGateResult {
     /// Emit these tool calls to the OpenAI client; optionally inject synthetic OK lines to Qwen.
@@ -1444,7 +1408,7 @@ mod tests {
 {"tool":"tool_17","args":{"x":42}}
 ```
 Done."#;
-        let tcs = detect_tools(&text, &tools);
+        let tcs = detect_tools(text, &tools);
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].name, "tool_17");
     }

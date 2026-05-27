@@ -537,8 +537,8 @@ fn parse_qwen_sse_line(line: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed == "[DONE]" {
         return None;
     }
-    if trimmed.starts_with("data: ") {
-        Some(trimmed[6..].trim().to_string())
+    if let Some(rest) = trimmed.strip_prefix("data: ") {
+        Some(rest.trim().to_string())
     } else {
         None
     }
@@ -562,7 +562,7 @@ where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::fmt::Display,
 {
-    body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))
+    body.map_err(|e| std::io::Error::other(format!("{}", e)))
         .boxed_unsync()
 }
 
@@ -1396,7 +1396,6 @@ async fn handler(
                         error!(error = %err_msg, "Qwen returned tool error in response text");
                         let tool_name = extract_tool_name_from_error(&err_msg);
                         let ok_fb = build_synthetic_tool_ok_feedback_for_name(&tool_name);
-                        let mut recovery_succeeded = false;
                         if let Some(pid) = &latest_pid {
                             match send_qwen_continuation_and_get_response(
                                 &session_id,
@@ -1425,7 +1424,6 @@ async fn handler(
                                     }
                                     let new_text = result.response_text;
                                     if !new_text.is_empty() {
-                                        recovery_succeeded = true;
                                         let new_tokens = estimate_tokens(&new_text);
                                         let total = prompt_tokens + new_tokens;
                                         let resp_value = serde_json::json!({
@@ -1458,18 +1456,16 @@ async fn handler(
                         } else {
                             warn!(chat_id = %session_id, "No latest_pid for tool error recovery; returning error");
                         }
-                        if !recovery_succeeded {
-                            let mut err = serde_json::json!({
-                                "message": err_msg,
-                                "type": "invalid_request_error",
-                            });
-                            err["available_tools"] = serde_json::json!(tools);
-                            return Ok(json_response(
-                                StatusCode::BAD_REQUEST,
-                                &serde_json::json!({"error": err}),
-                            )
-                            .map(|b| box_body(b)));
-                        }
+                        let mut err = serde_json::json!({
+                            "message": err_msg,
+                            "type": "invalid_request_error",
+                        });
+                        err["available_tools"] = serde_json::json!(tools);
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            &serde_json::json!({"error": err}),
+                        )
+                        .map(|b| box_body(b)));
                     }
                 }
 
