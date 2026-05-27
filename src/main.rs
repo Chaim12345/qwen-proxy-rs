@@ -821,8 +821,8 @@ async fn handler(
                                         tool_names = ?tcs.iter().map(|t| &t.name).collect::<Vec<_>>(),
                                         "Streaming: emitting validated tool calls to client (Phase 2 hard gate passed)"
                                     );
-                                    for (i, tc) in tcs.iter().take(1).enumerate() {
-                                        info!(tool = %tc.name, index = i, "Detected tool call (1 at a time)");
+                                    for (i, tc) in tcs.iter().enumerate() {
+                                        info!(tool = %tc.name, index = i, "Detected tool call");
                                         let tid = format!("call_{}", uuid::Uuid::new_v4());
                                         let args = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into());
                                         if is_responses_api {
@@ -1344,10 +1344,9 @@ async fn handler(
                     if !tcs.is_empty() {
                         let tool_calls: Vec<serde_json::Value> = tcs
                             .iter()
-                            .take(1)
                             .enumerate()
                             .map(|(i, tc)| {
-                                info!(tool = %tc.name, index = i, "Detected tool call in raw body (1 at a time)");
+                                info!(tool = %tc.name, index = i, "Detected tool call in raw body");
                                 let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
                                 let args = serde_json::to_string(&tc.args)
                                     .unwrap_or_else(|_| "{}".to_string());
@@ -1507,10 +1506,9 @@ async fn handler(
                 let resp_value = if !tcs.is_empty() {
                     let tool_calls: Vec<serde_json::Value> = tcs
                         .iter()
-                        .take(1)
                         .enumerate()
                         .map(|(i, tc)| {
-                            info!(tool = %tc.name, index = i, "Detected tool call (1 at a time)");
+                            info!(tool = %tc.name, index = i, "Detected tool call");
                             let tool_call_id = format!("call_{}", uuid::Uuid::new_v4());
                             let args = serde_json::to_string(&tc.args)
                                 .unwrap_or_else(|_| "{}".to_string());
@@ -1527,7 +1525,7 @@ async fn handler(
                         .collect();
 
                     if is_responses_api {
-                        let output: Vec<serde_json::Value> = tcs.iter().take(1).map(|tc| {
+                        let output: Vec<serde_json::Value> = tcs.iter().map(|tc| {
                             serde_json::json!({
                                 "type": "function_call",
                                 "id": format!("call_{}", uuid::Uuid::new_v4()),
