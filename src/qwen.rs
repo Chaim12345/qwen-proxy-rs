@@ -196,13 +196,11 @@ pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
         let end = text.find('.').unwrap_or(text.len());
         return Some(text[..end].to_string());
     }
+    let lower = text.to_lowercase();
     for phrase in ["cannot use", "can't use", "unable to use"] {
-        if let Some(pos) = text.find(phrase) {
-            let nearby = &text[pos..text.len().min(pos + 50)];
-            if nearby.to_lowercase().contains("tool") {
-                let end = text.find('.').unwrap_or(text.len().min(200));
-                return Some(text[..end].to_string());
-            }
+        if lower.contains(phrase) && lower.contains("tool") {
+            let end = text.find('.').unwrap_or(text.len().min(200));
+            return Some(text[..end].to_string());
         }
     }
     if text.contains("tool not found") || text.contains("tool_not_found") {
