@@ -199,7 +199,7 @@ pub fn detect_qwen_tool_error(text: &str) -> Option<String> {
     for phrase in ["cannot use", "can't use", "unable to use"] {
         if let Some(pos) = text.find(phrase) {
             let nearby = &text[pos..text.len().min(pos + 50)];
-            if nearby.contains("tool") {
+            if nearby.to_lowercase().contains("tool") {
                 let end = text.find('.').unwrap_or(text.len().min(200));
                 return Some(text[..end].to_string());
             }
@@ -703,7 +703,17 @@ pub fn truncate_for_context_limit(v: &mut Value, max_chars: usize) -> bool {
                 break 'inner;
             }
             if merged.len() <= 2 {
-                warn!("Conversation too large even for minimal messages; rejecting");
+                if removed_count > 0 {
+                    warn!(
+                        removed_msgs = removed_count,
+                        remaining_msgs = merged.len(),
+                        "Conversation history truncated (minimal remaining)"
+                    );
+                    truncated_any = true;
+                    *msgs = merged;
+                } else {
+                    warn!("Conversation too large even for minimal messages; rejecting");
+                }
                 break 'inner;
             }
             merged.remove(1);
