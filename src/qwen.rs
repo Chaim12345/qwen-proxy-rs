@@ -243,11 +243,10 @@ impl AccumulatedText {
     pub fn append(&mut self, delta: &QwenSseDelta) {
         match delta.phase {
             QwenPhase::ThinkingSummary | QwenPhase::Thinking => {
+                // Qwen sends cumulative thinking text, not deltas.
+                // Replace rather than append to avoid duplication.
                 if !delta.text.is_empty() {
-                    if !self.thinking.is_empty() {
-                        self.thinking.push('\n');
-                    }
-                    self.thinking.push_str(&delta.text);
+                    self.thinking = delta.text.clone();
                 }
             }
             QwenPhase::Answer | QwenPhase::Other(_) => {
@@ -469,16 +468,15 @@ pub async fn send_qwen_chat_continuation(
         let payload = qwen_payload(&chat_id, parent.as_deref(), &feedback, &upstream);
         let url = format!("{}/chat/completions?chat_id={}", crate::constants::QWEN_API_BASE, chat_id);
 
-        let req = ureq::post(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .set("accept", "text/event-stream")
-            .set("content-type", "application/json")
-            .set("referer", "https://chat.qwen.ai/")
-            .set("source", "web")
-            .set("version", "0.8.0")
-            .set("cookie", &format!("token={}", token));
+        let req = ureq::agent().post(&url)
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .header("referer", "https://chat.qwen.ai/")
+            .header("source", "web")
+            .header("version", "0.8.0")
+            .header("cookie", &format!("token={}", token));
 
-        let resp = match req.send_json(&payload) {
+        let resp = match req.send(&serde_json::to_vec(&payload).unwrap_or_default()) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, chat_id = %chat_id, "Phase 3 feedback POST failed (best-effort, no injection)");
@@ -490,12 +488,12 @@ pub async fn send_qwen_chat_continuation(
             warn!(chat_id = %chat_id, "Phase 3 feedback: Qwen token expired during send");
             return Ok(None);
         }
-        if !(200..300).contains(&resp.status()) {
-            warn!(status = resp.status(), chat_id = %chat_id, "Phase 3 feedback: non-2xx from Qwen");
+        if !resp.status().is_success() {
+            warn!(status = %resp.status(), chat_id = %chat_id, "Phase 3 feedback: non-2xx from Qwen");
             return Ok(None);
         }
 
-        let body_text = resp.into_string().unwrap_or_default();
+        let body_text = resp.into_body().read_to_string().unwrap_or_default();
 
         // Parse SSE (or fallback json) for the new response_id / parent from Qwen's reply to our feedback.
         let mut new_pid: Option<String> = None;
@@ -563,27 +561,26 @@ pub async fn send_qwen_continuation_and_get_response(
             chat_id
         );
 
-        let req = ureq::post(&url)
-            .timeout(std::time::Duration::from_secs(60))
-            .set("accept", "text/event-stream")
-            .set("content-type", "application/json")
-            .set("referer", "https://chat.qwen.ai/")
-            .set("source", "web")
-            .set("version", "0.8.0")
-            .set("cookie", &format!("token={}", token));
+        let req = ureq::agent().post(&url)
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .header("referer", "https://chat.qwen.ai/")
+            .header("source", "web")
+            .header("version", "0.8.0")
+            .header("cookie", &format!("token={}", token));
 
         let resp = req
-            .send_json(&payload)
+            .send(&serde_json::to_vec(&payload).unwrap_or_default())
             .map_err(|e| ::anyhow::anyhow!("Continuation POST failed: {}", e))?;
 
         if resp.status() == 401 {
             return Err(::anyhow::anyhow!("Qwen token expired"));
         }
-        if !(200..300).contains(&resp.status()) {
+        if !resp.status().is_success() {
             return Err(::anyhow::anyhow!("Qwen returned status {}", resp.status()));
         }
 
-        let body_text = resp.into_string().unwrap_or_default();
+        let body_text = resp.into_body().read_to_string().unwrap_or_default();
 
         let mut new_pid: Option<String> = None;
         let mut acc = AccumulatedText::new();

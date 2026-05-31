@@ -82,40 +82,70 @@ impl Stream for QwenSseStream {
 }
 
 pub fn build_http_client() -> Result<Client, String> {
+    // Build a custom rustls::ClientConfig using graviola (pure Rust) + webpki roots
+    // This bypasses rustls-platform-verifier which panics on Android/Termux
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter() {
+        root_store.add(cert.clone()).map_err(|e| format!("Failed to add root cert: {}", e))?;
+    }
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
     Client::builder()
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_keepalive(Duration::from_secs(30))
         .timeout(Duration::from_secs(300))
+        .tls_backend_preconfigured(tls_config)
         .build()
         .map_err(|e| format!("Failed to build reqwest client: {}", e))
 }
 
 /// Stream SSE lines from Qwen as they arrive (real streaming, not buffer-then-play).
+/// Retries on 429 (rate limit) with exponential backoff.
 pub async fn post_sse(
     client: Client,
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 ) -> Result<QwenSseStream, String> {
-    let mut req = client
-        .post(&url)
-        .header("accept", "text/event-stream")
-        .body(body);
-    for (k, v) in headers {
-        req = req.header(k, v);
-    }
+    let max_retries = 3;
+    let mut retry_delay = Duration::from_secs(1);
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("Qwen SSE request failed: {}", e))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        if status.as_u16() == 429 || body_text.contains("in progress") {
-            return Err("Qwen chat is busy (another message in flight)".to_string());
+    for attempt in 0..=max_retries {
+        let mut req = client
+            .post(&url)
+            .header("accept", "text/event-stream")
+            .body(body.clone());
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
         }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Qwen SSE request failed: {}", e))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(QwenSseStream::new(resp));
+        }
+
+        let body_text = resp.text().await.unwrap_or_default();
+
+        // Retry on 429 (rate limit) or "in progress" errors
+        if (status.as_u16() == 429 || body_text.contains("in progress")) && attempt < max_retries {
+            tracing::warn!(
+                attempt = attempt + 1,
+                max_retries = max_retries,
+                delay_ms = retry_delay.as_millis(),
+                "Rate limited, retrying..."
+            );
+            tokio::time::sleep(retry_delay).await;
+            retry_delay *= 2;
+            continue;
+        }
+
         return Err(format!(
             "Qwen API returned {}: {}",
             status,
@@ -123,5 +153,5 @@ pub async fn post_sse(
         ));
     }
 
-    Ok(QwenSseStream::new(resp))
+    unreachable!()
 }

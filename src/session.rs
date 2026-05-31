@@ -160,20 +160,23 @@ impl SessionManager {
                 "chat_type": "t2t",
                 "timestamp": chrono::Utc::now().timestamp_millis(),
             });
-            let resp = ureq::post(&format!("{}/chats/new", QWEN_API_BASE))
-                .set("accept", "application/json")
-                .set("content-type", "application/json")
-                .set("referer", "https://chat.qwen.ai/")
-                .set("source", "web")
-                .set("version", "0.8.0")
-                .set("cookie", &format!("token={}", token))
-                .send_json(&payload)
+            let mut resp = ureq::agent().post(&format!("{}/chats/new", QWEN_API_BASE))
+                .header("accept", "application/json")
+                .header("content-type", "application/json")
+                .header("referer", "https://chat.qwen.ai/")
+                .header("source", "web")
+                .header("version", "0.8.0")
+                .header("cookie", &format!("token={}", token))
+                .send(&serde_json::to_vec(&payload).context("serialize payload")?)
                 .map_err(|e| anyhow::anyhow!("Failed to create Qwen chat: {}", e))?;
             if resp.status() == 401 {
                 bail!("Qwen token expired or invalid");
             }
-            let d: serde_json::Value = resp
-                .into_json()
+            let body = resp
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| anyhow::anyhow!("Failed to read chat response: {}", e))?;
+            let d: serde_json::Value = serde_json::from_str(&body)
                 .map_err(|e| anyhow::anyhow!("Failed to parse chat response: {}", e))?;
             d["data"]["id"]
                 .as_str()

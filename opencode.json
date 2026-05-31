@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "qwen-proxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen Proxy",
+      "options": {
+        "baseURL": "http://localhost:8765/v1",
+        "timeout": false,
+        "chunkTimeout": 60000
+      },
+      "models": {
+        "qwen3.7-max": {
+          "name": "Qwen 3.7 Max",
+          "tool_call": true,
+          "reasoning": false
+        }
+      }
+    }
+  },
+  "model": "qwen-proxy/qwen3.7-max",
+  "small_model": "qwen-proxy/qwen3.7-max",
+  "disabled_providers": ["openai", "anthropic", "google", "opencode"]
+}

@@ -187,12 +187,11 @@ fn request_model(v: &serde_json::Value) -> String {
     )
 }
 
-/// OpenAI-compatible clients (Cursor, OpenCode, DeepSeek-compat) read `reasoning_content`
-/// in the delta — not a custom `thinking` field.
+/// OpenAI-compatible reasoning content for o1/o3-style models.
+/// Uses `reasoning_content` field only (not `thinking`).
 fn build_reasoning_delta(text: &str, first: bool, delta: &serde_json::Value) -> serde_json::Value {
     let mut out = serde_json::json!({
         "reasoning_content": text,
-        "thinking": text,
     });
     if first {
         out["role"] = serde_json::json!("assistant");
@@ -271,13 +270,7 @@ fn build_tool_call_stream_chunks(
         ));
     }
 
-    chunks.push(build_stream_chunk(
-        id,
-        model,
-        created,
-        serde_json::json!({}),
-        Some("tool_calls"),
-    ));
+    // Don't add finish_reason here - it's added at stream end
     chunks
 }
 
@@ -858,6 +851,7 @@ async fn handler(
                 })).unwrap_or_default());
                 st.resp_created = true;
                             }
+                // Emit reasoning_content for OpenAI-compatible thinking
                 let thinking = st.full_text.thinking();
                 if thinking.len() > st.prev_thinking_len {
                     let delta_text = &thinking[st.prev_thinking_len..];
@@ -1317,19 +1311,43 @@ async fn handler(
         let qwen_url2 = qwen_url.clone();
         let headers2 = headers.clone();
         let http_res: Result<(u16, String), String> = tokio::task::spawn_blocking(move || {
-            let mut req = ureq::post(&qwen_url2);
-            for (k, v) in &headers2 {
-                req = req.set(k.as_str(), v.as_str());
-            }
-            req = req.set("accept", "text/event-stream");
-            match req.send_bytes(&body_arc2) {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body_text = resp.into_string().unwrap_or_default();
-                    Ok((status, body_text))
+            let max_retries = 3;
+            let mut retry_delay = std::time::Duration::from_secs(1);
+
+            for attempt in 0..=max_retries {
+                let body_bytes: Vec<u8> = (*body_arc2).clone();
+                let mut req = ureq::agent().post(&qwen_url2);
+                for (k, v) in &headers2 {
+                    req = req.header(k.as_str(), v.as_str());
                 }
-                Err(e) => Err(format!("Qwen request failed: {}", e)),
+                req = req.header("accept", "text/event-stream");
+                match req.send(&body_bytes) {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let body_text = resp.into_body().read_to_string().unwrap_or_default();
+
+                        // Retry on 429 (rate limit)
+                        if status == 429 && attempt < max_retries {
+                            std::thread::sleep(retry_delay);
+                            retry_delay *= 2;
+                            continue;
+                        }
+
+                        return Ok((status, body_text));
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        // Retry on "in progress" errors
+                        if err_str.contains("in progress") && attempt < max_retries {
+                            std::thread::sleep(retry_delay);
+                            retry_delay *= 2;
+                            continue;
+                        }
+                        return Err(format!("Qwen request failed: {}", e));
+                    }
+                }
             }
+            unreachable!()
         })
         .await
         .map_err(|e| format!("spawn_blocking join error: {}", e))
@@ -1785,6 +1803,11 @@ async fn router(
 }
 
 fn main() -> Result<()> {
+    // Install graviola as the pure-Rust crypto provider for rustls (no ring, no aws-lc-sys)
+    rustls_graviola::default_provider()
+        .install_default()
+        .expect("Failed to install graviola crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
